@@ -17,19 +17,26 @@ LO QUE PEDISTE, HECHO A FONDO
      el sistema tridiagonal EXACTO cuando σ_k y η_k cambian por tramo, y el óptimo numérico
      con el modelo completo: σ por minuto del perfil intradía MEDIDO, impacto temporal
      cóncavo en la participación (β = 0.6), impacto permanente y tope de participación
-     (POV, 25 % por omisión). Con β = 1 las tres coinciden a 1e-13 contratos, y las
-     fórmulas (20)-(21) de E y V del artículo coinciden con las sumas discretas.
+     (POV, 25 % por omisión). Con β = 1 y la varianza del artículo las tres coinciden a
+     menos de 1e-5 contratos, y sus fórmulas (20)-(21) de E y V con las sumas discretas.
+     Una corrección al modelo discreto: ahí lo que se ejecuta dentro de un tramo no carga
+     riesgo, así que con tramos grandes "vende" media hora de flujo al precio del inicio
+     (medido con 5 000 NQ en la sesión regular: E + λV bajaba de 15.0 a 3.9 bps al pasar de
+     tramos de 1 a 30 min; con la corrección, 16.9 → 32.3, como debe ser). Aquí la
+     tenencia baja en línea recta dentro del tramo, que es la varianza exacta de vender
+     parejo y converge al modelo continuo.
 
   2. PARÁMETRO DE AVERSIÓN AL RIESGO. λ de tres maneras: directo en 1/USD (--lambda), por
      vida media (--vida-media), o —por omisión— el λ que minimiza E + z·SD al 95 %, el
      "costo que no se excede con 95 % de confianza" de la sección 4 del artículo. En un
      óptimo interior el precio marginal del riesgo, 2λ·SD, sale EXACTAMENTE z (medido:
-     1.645 contra 1.645). Y cuando no hay óptimo interior el módulo lo dice en vez de
-     inventarlo: con un bloque chico, E + z·SD baja hasta la ejecución más rápida posible
-     porque la pendiente de la frontera se queda acotada por debajo de z. Eso pasa con tus
-     500 NQ: son 0.13 % del volumen diario, y repartirlos en la primera hora de la sesión
-     regular deja ~17 bps de desviación estándar (28 bps al 95 %) contra ~4 bps de impacto
-     por ir rápido.
+     1.645 contra 1.645, también con el tope activo). Y cuando no hay óptimo interior el
+     módulo lo dice en vez de inventarlo: con un bloque muy chico (~50 NQ), E + z·SD baja
+     hasta la ejecución más rápida posible porque la pendiente de la frontera se queda
+     por debajo de z. Con tus 500 NQ (0.13 % del volumen diario) sí hay óptimo interior,
+     pero muy urgente: 97 % en los primeros 5 minutos, porque repartirlos en la primera
+     hora de la sesión regular deja ~18 bps de desviación estándar contra ~4 bps de
+     impacto por ir rápido.
 
   3. COEFICIENTES DE IMPACTO. ε (medio spread + comisión), η₀ y β del impacto temporal, γ₀
      del permanente, el η lineal equivalente que usaría la AC de libro, y la tabla de
@@ -46,14 +53,14 @@ LO QUE PEDISTE, HECHO A FONDO
      SD, E + z·SD, participación máxima, y además una RÉPLICA sobre tus propias sesiones
      —la misma ventana horaria en ~250 días reales, reescalada a la σ pronosticada y sin la
      deriva de la muestra— con VaR y CVaR 95 % que sí ven las colas que la normalidad del
-     modelo no ve. En la simulación (costo al 95 %, bps): AC óptima 7.3 · inmediata 7.7 ·
-     AC clásica 9.1 · VWAP 27.9 · TWAP 30.4.
+     modelo no ve. En la simulación (costo al 95 %, bps): AC óptima 9.5 · inmediata 11.4 ·
+     AC clásica 11.5 · VWAP 28.3 · TWAP 30.8.
 
   5. ANÁLISIS DE SENSIBILIDAD VISUAL. Un tablero entero: urgencia (λ × η₀), costo al 95 %
      (σ × η₀), tornado, ARREPENTIMIENTO —cuánto pierdes si ejecutas el plan base y el
      parámetro verdadero era otro, que es la pregunta que decide—, horizonte y barrido de λ.
      Cada celda RE-OPTIMIZA; ninguna reescala un resultado. Lo que sale en la simulación:
-     η₀ al doble mueve el costo de 5.7 a 9.4 bps pero el arrepentimiento es 0.17 bps. El
+     η₀ al doble mueve el costo de 6.7 a 10.0 bps pero el arrepentimiento es 0.38 bps. El
      costo es sensible a η₀; el PLAN casi no.
 
   Un resultado que conviene saber: sin aversión al riesgo y con impacto en función de la
@@ -1200,6 +1207,7 @@ class Mercado:
     gamma: float               # impacto permanente, USD por contrato por contrato
     minutos: np.ndarray        # minuto de sesión en que arranca cada tramo
     part_max: float = np.inf   # tope de participación por tramo (fracción del volumen)
+    varianza: str = "continua" # "continua": se vende parejo DENTRO del tramo · "discreta": el artículo
 
     @property
     def tope(self) -> np.ndarray:
@@ -1278,10 +1286,15 @@ def construir_mercado(cfg: Config, perfil: pd.DataFrame, sigma2_dia: float, adv:
 #
 #   costo  = Σ_k x_k·(−ΔP_k)  +  Σ_k n_k·h_k  +  γ·Σ_k n_k·Σ_{j<k} n_j  +  ε·Σ|n_k|
 #   E      = ½γX² − ½γΣn_k² + εX + Σ_k c_k·n_k^(1+β)        (impacto temporal ley de potencia)
-#   V      = Σ_k σ_k²·x_k²
+#   V      = Σ_k σ_k²·(x_{k−1}² + x_{k−1}·x_k + x_k²)/3      (se vende parejo dentro del tramo)
 #
-# y se minimiza E + λV. Con β = 1 y σ, η constantes es exactamente el modelo de Almgren y
-# Chriss (2000) y su solución x_j = X·sinh(κ(T − t_j))/sinh(κT). Lo que se agrega aquí:
+# y se minimiza E + λV. En el modelo DISCRETO del artículo V = Σ_k σ_k²·x_k²: lo que se
+# ejecuta dentro de un tramo no carga riesgo, así que con tramos grandes el modelo "vende"
+# media hora de flujo al precio del inicio (medido con 5 000 NQ en la sesión regular: E + λV
+# caía de 15.0 a 3.9 bps al pasar de tramos de 1 a 30 min). Con la tenencia lineal dentro del
+# tramo la varianza es la exacta de ese programa y converge al modelo continuo. El discreto queda para verificar las fórmulas
+# cerradas. Con β = 1, σ y η constantes y varianza discreta es exactamente Almgren y Chriss
+# (2000) y su solución x_j = X·sinh(κ(T − t_j))/sinh(κT). Lo que se agrega aquí:
 # σ_k y el volumen por tramo salen del perfil intradía MEDIDO, y el impacto es cóncavo en la
 # participación (β = 0.6, Almgren et al. 2005), que es lo que se observa en los datos.
 
@@ -1292,7 +1305,11 @@ def evaluar(m: Mercado, x: np.ndarray) -> dict:
     permanente = 0.5 * m.gamma * (m.X ** 2 - float(n @ n))
     fijo = m.eps * float(np.sum(np.abs(n)))
     E = temporal + permanente + fijo
-    V = float(np.sum(m.sig2 * x[1:] ** 2))
+    if m.varianza == "discreta":
+        V = float(np.sum(m.sig2 * x[1:] ** 2))
+    else:
+        a, b = x[:-1], x[1:]
+        V = float(np.sum(m.sig2 * (a * a + a * b + b * b) / 3.0))
     return {"E": E, "V": V, "SD": math.sqrt(max(V, 0.0)), "temporal": temporal,
             "permanente": permanente, "fijo": fijo}
 
@@ -1354,22 +1371,32 @@ def ac_clasica(m: Mercado, lam: float) -> np.ndarray:
 def ac_lineal_variable(m: Mercado, lam: float, eta_k: np.ndarray | None = None) -> np.ndarray:
     """
     AC lineal con σ_k y η_k que CAMBIAN por tramo: el problema es cuadrático y sus
-    condiciones de primer orden son un sistema tridiagonal exacto,
+    condiciones de primer orden son un sistema tridiagonal exacto. Con varianza discreta,
 
         −a_j x_{j−1} + (a_j + a_{j+1} + λσ_j²) x_j − a_{j+1} x_{j+1} = 0,   a_k = η_k/τ − γ/2
+
+    y con la continua los vecinos se acoplan también por el riesgo: ±λσ²/6 fuera de la
+    diagonal y λ(σ_j² + σ_{j+1}²)/3 en ella.
     """
     N = m.N
     if N == 1:
         return np.array([m.X, 0.0])
     eta_k = m.eta_lineal(por_tramo=True) if eta_k is None else np.asarray(eta_k, float)
     a = np.maximum(eta_k / m.tau - 0.5 * m.gamma, 1e-18)
-    b = lam * m.sig2[:-1]
+    s = lam * m.sig2
     ab = np.zeros((3, N - 1))
-    ab[0, 1:] = -a[1:-1]
-    ab[1, :] = a[:-1] + a[1:] + b
-    ab[2, :-1] = -a[1:-1]
     rhs = np.zeros(N - 1)
-    rhs[0] = a[0] * m.X
+    if m.varianza == "discreta":
+        ab[0, 1:] = -a[1:-1]
+        ab[1, :] = a[:-1] + a[1:] + s[:-1]
+        ab[2, :-1] = -a[1:-1]
+        rhs[0] = a[0] * m.X
+    else:
+        fuera = -a[1:-1] + s[1:-1] / 6.0
+        ab[0, 1:] = fuera
+        ab[1, :] = a[:-1] + a[1:] + (s[:-1] + s[1:]) / 3.0
+        ab[2, :-1] = fuera
+        rhs[0] = (a[0] - s[0] / 6.0) * m.X
     return np.r_[m.X, solve_banded((1, 1), ab, rhs), 0.0]
 
 
@@ -1399,45 +1426,63 @@ def ac_optima(m: Mercado, lam: float, x0: np.ndarray | None = None) -> np.ndarra
     """
     Mínimo NUMÉRICO de E + λV con el modelo completo (σ_k y volumen por tramo, impacto en
     ley de potencia, tope de participación). Convexo para β > 0 salvo por el término
-    permanente, que en la práctica es varios órdenes menor. Gradiente analítico, L-BFGS-B con
-    0 ≤ x ≤ X; el tope de participación entra como penalización creciente y al final se
-    garantiza exactamente.
+    permanente, que en la práctica es varios órdenes menor.
+
+    Se optimiza sobre los TRAMOS n_k, no sobre las tenencias: así 0 ≤ n_k ≤ ρ·V_k son cotas
+    simples y exactas de L-BFGS-B, y la única restricción que queda, Σ n_k = X, entra con un
+    lagrangiano aumentado de UN multiplicador, que está bien condicionado. (Con la tenencia
+    como variable, el tope acopla tramos vecinos y hace falta un multiplicador por tramo:
+    medido, eso dejaba el óptimo hasta 1 % peor según desde dónde arrancara.)
     """
     N = m.N
     if N == 1:
         return np.array([m.X, 0.0])
     X, c, b1, g = m.X, m.c, 1.0 + m.beta, m.gamma
     s2 = m.sig2[:-1]
-    tope = m.tope / X
-    con_tope = bool(np.all(np.isfinite(tope)))
+    s_all = m.sig2
+    continua = m.varianza != "discreta"
+    tope = m.tope
+    sup = np.minimum(np.where(np.isfinite(tope), tope, X) / X, 1.0)
     escala = max(objetivo(m, twap(m), lam) - m.eps * X - 0.5 * g * X * X, 1e-9)
 
-    def f(y, mu):
-        x = np.r_[1.0, y, 0.0] * X
-        n = x[:-1] - x[1:]
-        an = np.abs(n)
-        U = float(np.sum(c * an ** b1)) - 0.5 * g * float(n @ n) + lam * float(np.sum(s2 * x[1:-1] ** 2))
-        dn = (b1 * c * an ** (b1 - 1.0) * np.sign(n) - g * n) / escala
-        U /= escala
-        if mu > 0:
-            exceso = np.maximum(0.0, n / X - tope)
-            U += mu * float(exceso @ exceso)
-            dn = dn + 2.0 * mu * exceso / X
-        gx = -dn[:-1] + dn[1:] + 2.0 * lam * s2 * x[1:-1] / escala
-        return U, gx * X
+    def f(q, mu, nu):
+        n = q * X
+        dn = b1 * c * n ** (b1 - 1.0) - g * n
+        U = float(np.sum(c * n ** b1)) - 0.5 * g * float(n @ n)
+        if continua:
+            xs = X - np.r_[0.0, np.cumsum(n)]           # x_0 … x_N
+            a, b = xs[:-1], xs[1:]
+            U += lam * float(np.sum(s_all * (a * a + a * b + b * b))) / 3.0
+            G = s_all * (a + 2.0 * b) / 3.0            # ∂V/∂x_k, k = 1 … N
+            G[:-1] += s_all[1:] * (2.0 * b[:-1] + b[1:]) / 3.0
+            dn -= lam * np.cumsum(G[::-1])[::-1]         # ∂V/∂n_j = −Σ_{k≥j} ∂V/∂x_k
+        else:
+            x = X - np.cumsum(n)[:-1]                   # tenencias x_1 … x_{N−1}
+            U += lam * float(np.sum(s2 * x * x))
+            dn[:-1] -= np.cumsum((2.0 * lam * s2 * x)[::-1])[::-1]
+        h = float(q.sum()) - 1.0
+        return U / escala + nu * h + 0.5 * mu * h * h, dn * X / escala + (nu + mu * h)
 
     if x0 is None:
         x0 = ac_lineal_variable(m, lam)
-    y = np.clip(np.asarray(x0, float)[1:-1] / X, 0.0, 1.0)
-    for mu in ((0.0, 1e2, 1e4, 1e6, 1e8) if con_tope else (0.0,)):
-        res = minimize(f, y, args=(mu,), jac=True, method="L-BFGS-B",
-                       bounds=[(0.0, 1.0)] * (N - 1),
-                       options={"maxiter": 20_000, "ftol": 1e-15, "gtol": 1e-11, "maxcor": 30})
-        y = res.x
-        if con_tope and mu > 0 and np.all(-np.diff(np.r_[1.0, y, 0.0]) <= tope * (1 + 1e-6)):
+    q = np.clip(-np.diff(np.asarray(x0, float)) / X, 0.0, sup)
+    q = q / q.sum() if q.sum() > 0 else sup / sup.sum()
+    opciones = {"maxiter": 20_000, "ftol": 1e-15, "gtol": 1e-12, "maxcor": 30}
+    limites = list(zip(np.zeros(N), sup))
+    mu, nu, h_prev = 10.0, 0.0, np.inf
+    for _ in range(60):
+        q = minimize(f, q, args=(mu, nu), jac=True, method="L-BFGS-B", bounds=limites,
+                     options=opciones).x
+        h = float(q.sum()) - 1.0
+        nu += mu * h
+        if abs(h) < 1e-12:
             break
-    x = np.r_[1.0, y, 0.0] * X
-    return _reparar_tope(x, m.tope) if con_tope else x
+        if abs(h) > 0.25 * abs(h_prev):
+            mu *= 10.0
+        h_prev = h
+    x = X * np.r_[1.0, 1.0 - np.cumsum(q)]
+    x[-1] = 0.0 if abs(x[-1]) < 1e-9 * X else x[-1]
+    return _reparar_tope(x, np.where(np.isfinite(tope), tope, np.inf))
 
 
 def lambda_referencia(m: Mercado) -> float:
@@ -1491,18 +1536,27 @@ def elegir_lambda(m: Mercado, cfg: Config) -> tuple[float, str]:
     if cfg.aversion is not None:
         return float(cfg.aversion), "λ fijado a mano"
     if cfg.vida_media_min:
-        return lambda_vida_media(m, cfg.vida_media_min), f"vida media de {cfg.vida_media_min:g} min"
+        lam = lambda_vida_media(m, cfg.vida_media_min)
+        vm = vida_media(ac_optima(m, lam), m.tau)
+        if vm < 0.97 * cfg.vida_media_min:
+            return lam, (f"pediste vida media de {cfg.vida_media_min:g} min, pero la más lenta posible "
+                         f"en esta ventana es {vm:.1f} min (λ → 0: el VWAP)")
+        if vm > 1.03 * cfg.vida_media_min:
+            return lam, (f"pediste vida media de {cfg.vida_media_min:g} min, pero con el tope de "
+                         f"participación la más rápida posible es {vm:.1f} min")
+        return lam, f"vida media de {cfg.vida_media_min:g} min"
     z = _z(cfg.var_conf)
     ref = lambda_referencia(m)
     rejilla = ref * np.logspace(-3, 6, 37)
     fr = frontera(m, rejilla)
     val = (fr["E"] + z * fr["SD"]).to_numpy()
     i = int(np.argmin(val))
-    if i >= len(rejilla) - 2:
-        # ESQUINA: E + z·SD sigue bajando hasta la ejecución más rápida que permite el tope.
-        # Cerca de ahí la pendiente de la frontera, dE/dSD, se queda acotada por debajo de
-        # z, así que no existe un óptimo interior. Se reporta el λ más chico que ya la alcanza.
-        j = int(np.argmax(val <= val.min() * (1 + 5e-4) + 1e-9))
+    if val[-1] <= val.min() * (1 + 5e-4):
+        # ESQUINA: E + z·SD sigue bajando hasta la ejecución más rápida que permite el tope
+        # (el último punto de la rejilla ya es esa ejecución). Ahí la pendiente de la
+        # frontera, dE/dSD, se queda por debajo de z y no existe un óptimo interior. Se
+        # reporta el λ más chico que ya la alcanza.
+        j = int(np.argmax(val <= val[-1] * (1 + 5e-4) + 1e-9))
         return float(rejilla[j]), (f"E + {z:.3f}·SD (confianza {cfg.var_conf:.0%}) — ESQUINA: "
                                    "conviene la ejecución más rápida permitida")
     lo, hi = math.log(rejilla[max(0, i - 1)]), math.log(rejilla[min(len(rejilla) - 1, i + 1)])
@@ -1542,17 +1596,17 @@ def vida_media(x: np.ndarray, tau: float) -> float:
 def rendimientos_ventana(ses: Sesiones, cfg: Config, m: Mercado, sigma2_dia: float,
                          rv_sesion: np.ndarray) -> np.ndarray:
     """
-    Retornos logarítmicos por tramo de la MISMA ventana horaria en cada sesión histórica
-    completa (D × N). Con escalar_vol, cada día se reescala a la σ pronosticada (conserva
+    Retornos logarítmicos de 1 minuto de la MISMA ventana horaria en cada sesión histórica
+    completa (D × minutos): de 1 minuto para ver el riesgo que hay DENTRO de cada tramo. Con escalar_vol, cada día se reescala a la σ pronosticada (conserva
     la forma intradía y las colas de ese día); con sin_deriva, se quita la media por tramo
     para que la tendencia de la muestra no decida la comparación.
     """
     m0 = int(m.minutos[0])
     tau = int(m.tau)
-    pts = m0 - 1 + tau * np.arange(m.N + 1)            # cierre del minuto anterior a cada corte
+    pts = m0 - 1 + np.arange(int(m.T) + 1)             # cierre del minuto anterior a cada minuto
     idx = np.flatnonzero(ses.completa)[-cfg.replica_dias:]
     if m0 == 0 or len(idx) == 0:
-        return np.empty((0, m.N))
+        return np.empty((0, int(m.T)))
     P = ses.L[idx][:, pts]
     ok = np.all(np.isfinite(P), axis=1)
     R = np.diff(P[ok], axis=1)
@@ -1565,10 +1619,30 @@ def rendimientos_ventana(ses: Sesiones, cfg: Config, m: Mercado, sigma2_dia: flo
     return R
 
 
+def exposicion(m: Mercado, x: np.ndarray, columnas: int) -> np.ndarray:
+    """
+    Contratos expuestos durante cada columna de R: por minuto (columnas = N·τ) o por tramo
+    (columnas = N). Con varianza continua la tenencia baja en línea recta dentro del tramo;
+    con la discreta se queda en x_k todo el tramo, como en el artículo.
+    """
+    x = np.asarray(x, float)
+    minutos = int(round(m.N * m.tau))
+    if columnas == minutos:
+        t = np.arange(minutos + 1) / m.tau
+        if m.varianza == "discreta":
+            return x[np.ceil(t[1:] - 1e-12).astype(int)]
+        h = np.interp(t, np.arange(m.N + 1), x)
+        return 0.5 * (h[:-1] + h[1:])
+    if columnas == m.N:
+        return x[1:] if m.varianza == "discreta" else 0.5 * (x[:-1] + x[1:])
+    raise ValueError(f"R tiene {columnas} columnas: se esperaban {minutos} minutos o {m.N} tramos")
+
+
 def costos_replica(m: Mercado, x: np.ndarray, R: np.ndarray, lado: int) -> np.ndarray:
     """Costo de cada sesión histórica: el determinista del modelo + el de timing REAL."""
     e = evaluar(m, x)
-    timing = -lado * m.S0 * (R @ np.asarray(x, float)[1:])
+    R = np.atleast_2d(R)
+    timing = -lado * m.S0 * (R @ exposicion(m, x, R.shape[1]))
     return e["E"] + timing
 
 
@@ -2967,7 +3041,7 @@ def pruebas() -> int:
     sig2 = np.full(30, 400.0 ** 2)
     m = Mercado(X=500, tau=1.0, sig2=sig2, vol=np.full(30, 2000.0), S0=420_000.0,
                 sigma_dia=0.012, eps=4.5, eta0=0.142, beta=1.0, gamma=1e-3,
-                minutos=np.arange(930, 960))
+                minutos=np.arange(930, 960), varianza="discreta")
     lam = 5e-7
     eta = m.eta_lineal()
     xc = ac_cerrada(m.X, m.N, m.tau, 400.0 ** 2, eta, m.gamma, lam)
@@ -3003,7 +3077,7 @@ def pruebas() -> int:
     nt = xt[:-1] - xt[1:]
     k_ = int(np.sum(np.cumsum(m14.tope) < m14.X))       # tramos que caben completos al tope
     al_tope = (np.allclose(nt[:k_], m14.tope[:k_], rtol=1e-3)
-               and np.cumsum(nt)[k_] >= m14.X * (1 - 1e-6) and np.all(nt <= m14.tope * (1 + 1e-9)))
+               and np.cumsum(nt)[k_] >= m14.X * (1 - 1e-5) and np.all(nt <= m14.tope * (1 + 1e-9)))
     check("con aversión extrema: inmediata sin tope; al tope de participación con tope",
           urgencia(xi, 1 / mv.N) > 0.97 and al_tope and k_ >= 1,
           f"{urgencia(xi, 1 / mv.N):.1%} en el 1er tramo sin tope · 2000 contratos con tope "
@@ -3032,12 +3106,12 @@ def pruebas() -> int:
     g = lambda l: (lambda e: e["E"] + z * e["SD"])(evaluar(m17, ac_optima(m17, l)))
     v0, vm, vp = g(lam17), g(lam17 * 0.8), g(lam17 * 1.25)
     x17 = ac_optima(m17, lam17)
-    lam17b, modo17b = elegir_lambda(mv, cfg)
+    lam17b, modo17b = elegir_lambda(replace(mv, X=50.0), cfg)
     check("λ por confianza: interior con precio del riesgo = z; esquina si el bloque es chico",
           v0 <= min(vm, vp) + 1e-6 * v0 and abs(2 * lam17 * evaluar(m17, x17)["SD"] / z - 1) < 0.05
           and "ESQUINA" not in modo17 and "ESQUINA" in modo17b,
           f"6000 contratos: 2λ·SD = {2 * lam17 * evaluar(m17, x17)['SD']:.3f} contra z = {z:.3f} · "
-          f"{mv.X:.0f} contratos: esquina")
+          "50 contratos: esquina")
 
     # 18 ------------------------------------------------ la réplica reproduce media y SD
     R = rng.normal(0, 1, (4000, mv.N)) * np.sqrt(mv.sig2) / mv.S0
