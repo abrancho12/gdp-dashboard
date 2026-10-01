@@ -69,7 +69,7 @@ LO QUE PEDISTE, HECHO A FONDO
 
   Además: fotos cada 15 min (--paso, --hora), 4 CSV (por strike, por opción, el día y el perfil),
   Telegram con resumen y tableros, un simulador que escribe registros DBN de verdad y entra por
-  la misma normalización que tus datos, y 24 pruebas internas.
+  la misma normalización que tus datos, y 25 pruebas internas.
 
 QUÉ SE MIDIÓ — 12 días simulados: futuro, smile, OI y flujo de clientes conocidos
 
@@ -151,7 +151,7 @@ LÍMITES QUE CONVIENE SABER
 
 CÓMO SE USA
     pip install numpy pandas scipy matplotlib databento
-    python flujo_0dte.py --pruebas                       # 24 pruebas, sin red
+    python flujo_0dte.py --pruebas                       # 25 pruebas, sin red
     python flujo_0dte.py --simulacion                    # día 0DTE simulado con verdad conocida
     python flujo_0dte.py                                 # ES, viernes 25 de septiembre de 2026
     python flujo_0dte.py --fecha 2026-09-29 --hora 10:30 # otro día; la foto principal a las 10:30 CT
@@ -1997,7 +1997,7 @@ def construir_parser() -> argparse.ArgumentParser:
     p.add_argument("--convencion", choices=CONVENCIONES)
     p.add_argument("--productos", help="familias de opciones separadas por coma, p. ej. ES,EW,EW4,E1A")
     p.add_argument("--tasa", type=float)
-    p.add_argument("--rango", type=float, dest="rango_pct", help="perfil de cobertura ±% (0.03)")
+    p.add_argument("--rango", type=float, dest="rango_pct", help="perfil de cobertura ±%% (0.03)")
     p.add_argument("--costo-max", type=float, dest="costo_max_usd")
     p.add_argument("--salida", dest="salida_dir", help="carpeta para CSV y PNG (salidas_0dte/)")
     p.add_argument("--sin-grafica", "--sin-tablero", action="store_true", dest="sin_tablero")
@@ -2268,6 +2268,12 @@ def pruebas() -> int:
             check("reportes, tableros y CSV", False, repr(e))
 
     # 20 ----------------------------------------- línea de comandos
+    try:                                         # Python ≥ 3.14 valida cada help al crear el parser
+        ayuda = construir_parser().format_help()
+    except Exception as e:                                    # pragma: no cover
+        ayuda = repr(e)
+    check("la ayuda (--help) se arma sin errores en cualquier versión de Python",
+          "--rango" in ayuda and "±%" in ayuda and "%%" not in ayuda, ayuda[-120:])
     a_ = construir_parser().parse_args(["--activo", "nq", "--fecha", "2026-09-24", "--hora", "11:15", "--convencion",
                                         "clasica", "--productos", "nq,qn,q4c", "--paso", "30"])
     c_ = config_desde_args(a_)
