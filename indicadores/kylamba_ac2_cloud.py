@@ -16,6 +16,10 @@ Cada bloque del código lleva la etiqueta del punto que resuelve:
        arriba del mid, el programa lo grita (así se habría detectado el signo invertido de v1/v2).
      · λ asimétrico: λ⁺ (impacto de las compras) y λ⁻ (de las ventas). Si comprar mueve más el precio
        que vender, el lado del ask está delgado: el mercado es vulnerable al alza (y al revés).
+     · Dirección con dos evidencias: IMPACTO (t de λ⁺ − λ⁻) y LIBRO (z del sesgo de profundidad
+       log(bid/ask): positivo = ask más delgado de lo normal a esa hora). Basta una que pase su umbral sin
+       que la otra la contradiga. "Simétrica" solo si hubo medición y no se inclinó; si no hubo medición
+       es "sin dato" (en v4 ambas se mostraban como "simétrica").
 
  [2] REGRESIÓN CAUSAL DINÁMICA
      · Mínimos cuadrados con olvido exponencial (vida media en horas), equivalente a un filtro de Kalman
@@ -42,7 +46,9 @@ Cada bloque del código lleva la etiqueta del punto que resuelve:
                + confirmación de IMPACTO (Amihud o λ estimado con OFI, un segundo estimador)
                + confirmación del LIBRO  (spread más ancho o menos profundidad de lo normal a esa hora)
      · Persistencia, histéresis (rearme) y enfriamiento. Cada alerta abre un episodio con duración,
-       z máximo y dirección de la vulnerabilidad.
+       z máximo y dirección de la vulnerabilidad (la de la barra de la alerta: buscarla después dentro
+       del episodio multiplica las direcciones falsas en vacíos simétricos; ver la calibración en el
+       comentario de direccion_por_barra).
 
  [6] AUDITORÍA DE IMPACTO POSTERIOR
      · Calibración predictiva: ¿el λ de ahora predice el impacto real de las próximas barras?
@@ -81,7 +87,7 @@ import databento as db
 import numpy as np
 import pandas as pd
 
-IDENTIFICADOR = "kylamba-v4"
+IDENTIFICADOR = "kylamba-v4.1"
 
 
 # =============================================================================
@@ -148,7 +154,8 @@ class Config:
     persistencia_min: int = 3                # barras consecutivas cumpliendo todo
     rearme_z: float = 1.0                    # histéresis: el z debe bajar de aquí para rearmar
     cooldown_h: float = 2.0
-    t_direccion: float = 2.0                 # |t| de λ⁺ − λ⁻ para declarar dirección
+    t_direccion: float = 2.0                 # |t| de λ⁺ − λ⁻ para declarar dirección (canal de impacto)
+    z_libro_direccion: float = 2.5           # |z| del sesgo de profundidad bid/ask (canal del libro)
     z_severa: float = 4.0
 
     # --- [6] Auditoría ---
@@ -223,6 +230,8 @@ def validar_config(cfg: Config) -> list[str]:
                       f"{cfg.n_eff_min:.0f}: casi todo quedará en blanco. Sube --vida-media o baja --barra.")
     if cfg.fuente == "trades" and cfg.confirmacion == "doble":
         avisos.append("Con --fuente trades no hay libro: la doble confirmación se reduce al canal de impacto.")
+    if cfg.fuente == "trades":
+        avisos.append("Con --fuente trades la dirección solo usa λ⁺ − λ⁻ (no hay profundidad bid/ask).")
     return avisos
 
 
@@ -850,8 +859,7 @@ def calcular_indicador(barras: pd.DataFrame, cfg: Config, tick: float, mult: flo
         df["lambda_venta_pts"] = np.where(ok_dir, ln, np.nan)
         df["asimetria"] = np.where(ok_dir, (lp - ln) / (lp + ln), np.nan)
         df["t_asimetria"] = np.where(ok_dir, (lp - ln) / np.sqrt(reg_p["se"] ** 2 + reg_n["se"] ** 2), np.nan)
-    df["direccion"] = np.select([df["t_asimetria"] >= cfg.t_direccion, df["t_asimetria"] <= -cfg.t_direccion],
-                                ["alza", "baja"], "neutral")
+    # (la etiqueta de dirección se decide al final, junto con la evidencia del libro)
 
     # --- [4] Escala institucional ---
     precio = ref.ffill()
@@ -904,7 +912,43 @@ def calcular_indicador(barras: pd.DataFrame, cfg: Config, tick: float, mult: flo
     df["desbalance_ew"] = mem_libro.media(df["desbalance"])
     df["spread_z"] = normalizar(_log_pos(df["spread_ew"]), franja, cfg)[0]
     df["prof_z"] = normalizar(_log_pos(df["prof_ew"]), franja, cfg)[0]
+
+    # --- [1][5] Lado delgado del libro: profundidad bid vs ask, contra lo normal a esa hora ---
+    # sesgo > 0: el ask está más delgado que el bid (comprar encuentra menos liquidez) → vulnerable al alza.
+    df["prof_bid_ew"] = mem_libro.media(df["prof_bid"])
+    df["prof_ask_ew"] = mem_libro.media(df["prof_ask"])
+    df["sesgo_libro"] = _log_pos(df["prof_bid_ew"]) - _log_pos(df["prof_ask_ew"])
+    df["sesgo_libro_z"] = normalizar(df["sesgo_libro"], franja, cfg)[0]
+
+    # --- [1] Dirección por barra: impacto (λ⁺ vs λ⁻) + libro (qué lado está delgado) ---
+    df["direccion"] = direccion_por_barra(df["t_asimetria"], df["sesgo_libro_z"], cfg)
     return df
+
+
+def direccion_por_barra(t_impacto: pd.Series, z_libro: pd.Series, cfg: Config) -> np.ndarray:
+    """Dirección de la vulnerabilidad en cada barra con dos evidencias firmadas (+ = alza, − = baja):
+    impacto = t de λ⁺ − λ⁻ (Newey-West) y libro = z desestacionalizado de log(prof_bid/prof_ask).
+    Un lado se declara si el impacto pasa t_direccion o el libro pasa z_libro_direccion, y la otra
+    evidencia no lo contradice (apuntar al lado opuesto con |z| ≥ umbral_conf_z).
+    Etiquetas: alza / baja / neutral (hubo medición y no se inclinó) / sin_dato (no hubo medición).
+
+    Calibración con vacíos plantados (generar_sintetico, 84 corridas, 360 vacíos de un lado detectados y
+    236 de ambos lados): solo con impacto (v4) la dirección acierta 85% de los vacíos de un lado (76% con
+    la mitad de actividad, tipo 6E); con el libro, 96-97%, sin subir las direcciones falsas en vacíos
+    simétricos (3-4%; 10-11% con poca actividad) y sin ningún lado invertido. Buscar la dirección después
+    de la alerta (dentro del episodio) sube los aciertos a ~100% pero las falsas a 9-16% (67% si se
+    busca en todo el episodio): por eso se evalúa en la barra de la alerta."""
+    ti, zl = t_impacto.to_numpy(dtype=float), z_libro.to_numpy(dtype=float)
+    hay_i, hay_l = np.isfinite(ti), np.isfinite(zl)
+    i0, l0 = np.where(hay_i, ti, 0.0), np.where(hay_l, zl, 0.0)        # sin medición = sin evidencia
+    c = cfg.umbral_conf_z
+
+    def hacia(s: float) -> np.ndarray:
+        imp, lib = s * i0, s * l0
+        return (hay_i & (imp >= cfg.t_direccion) & (lib > -c)) | (hay_l & (lib >= cfg.z_libro_direccion) & (imp > -c))
+
+    alza, baja = hacia(1.0), hacia(-1.0)
+    return np.select([alza & ~baja, baja & ~alza, hay_i | hay_l], ["alza", "baja", "neutral"], "sin_dato")
 
 
 # Nombre de v3, por compatibilidad con otros scripts
@@ -970,7 +1014,7 @@ def detectar_senales(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             "slippage_bps", "costo_usd", "z_senal", "disparo", "lambda_z", "lambda_compra_z", "lambda_venta_z",
             "lambda_pct", "lambda_tipico_bps", "amihud_z",
             "lambda_alt_z", "spread_z", "prof_z", "conf_impacto", "conf_libro", "direccion", "asimetria",
-            "t_asimetria", "desbalance_ew", "R2", "t_hac", "n_eff", "persistencia"]
+            "t_asimetria", "sesgo_libro_z", "desbalance_ew", "R2", "t_hac", "n_eff", "persistencia"]
     alertas = df.iloc[inicios][cols].copy()
     if len(alertas):
         fin_idx = [f if f is not None else len(df) - 1 for f in fines]
@@ -1246,6 +1290,14 @@ def imprimir_medicion(df: pd.DataFrame, cfg: Config, tick: float) -> None:
     pasa = {f[2:]: df[f].mean() for f in df.columns if f.startswith("f_")}
     print(f"λ utilizable en {df['valido'].mean():.1%} de las barras. Pasa cada filtro: "
           + " · ".join(f"{k} {v:.0%}" for k, v in pasa.items()))
+    ti, zl = df["t_asimetria"], df["sesgo_libro_z"]
+    if ti.notna().any() or zl.notna().any():
+        dist = df["direccion"].value_counts(normalize=True)
+        print(f"Evidencia de dirección: |t λ⁺−λ⁻| ≥ {cfg.t_direccion:g} en {(ti.abs() >= cfg.t_direccion).mean():.1%} "
+              f"de las barras (asimetría mediana {df['asimetria'].abs().median():.2f}) · |z sesgo del libro| ≥ "
+              f"{cfg.z_libro_direccion:g} en {(zl.abs() >= cfg.z_libro_direccion).mean():.1%} · dirección declarada: "
+              f"▲ {dist.get('alza', 0):.1%}, ▼ {dist.get('baja', 0):.1%}, simétrica {dist.get('neutral', 0):.1%}, "
+              f"sin dato {dist.get('sin_dato', 0):.1%}")
     print(f"R² mediano {df['R2'].median():.3f} · t Newey-West mediano {df['t_hac'].median():.1f} · "
           f"muestra efectiva mediana {df['n_eff'].median():.0f} barras")
     ok = df["lambda_bps"].dropna()
@@ -1268,7 +1320,6 @@ def imprimir_alertas(alertas: pd.DataFrame, cfg: Config) -> None:
     if alertas.empty:
         print("\nSin alertas de vacío de liquidez con los filtros actuales.")
         return
-    flecha = {"alza": "▲ vulnerable al alza", "baja": "▼ vulnerable a la baja", "neutral": "◆ simétrico"}
     print(f"\n💧 {len(alertas)} alertas de vacío de liquidez [5] (hora CDMX, al cierre de la barra):")
     for t, r in alertas.iterrows():
         conf = "+".join(n for n, ok in (("impacto", r["conf_impacto"]), ("libro", r["conf_libro"])) if ok)
@@ -1276,7 +1327,25 @@ def imprimir_alertas(alertas: pd.DataFrame, cfg: Config) -> None:
               f"{r['disparo']} (máx {r['z_max']:+.2f}, {r['duracion_min']:.0f} min) · λ={r['lambda_bps']:.5f} bps/contrato "
               f"({r['lambda_bps'] / r['lambda_tipico_bps']:.1f}× lo típico a esa hora) · "
               f"{r['profundidad_kyle']:,.0f} contratos/tick · {cfg.tamano_orden} contratos ≈ US$ "
-              f"{r['costo_usd']:,.0f} · {flecha.get(r['direccion'], r['direccion'])} · confirma: {conf or '—'}")
+              f"{r['costo_usd']:,.0f} · {texto_direccion(r)} · confirma: {conf or '—'}")
+    if len(alertas) < 2:
+        return
+    cuenta = alertas["direccion"].value_counts()
+    print(f"   Dirección: ▲ {cuenta.get('alza', 0)} · ▼ {cuenta.get('baja', 0)} · ◆ simétricas "
+          f"{cuenta.get('neutral', 0)} · sin dato {cuenta.get('sin_dato', 0)}. Umbrales: |t λ⁺−λ⁻| ≥ "
+          f"{cfg.t_direccion:g} o |z libro| ≥ {cfg.z_libro_direccion:g} sin que la otra evidencia lo contradiga.")
+
+
+FLECHAS = {"alza": "▲ vulnerable al alza", "baja": "▼ vulnerable a la baja", "neutral": "◆ simétrico",
+           "sin_dato": "○ sin dato de dirección"}
+
+
+def texto_direccion(r: pd.Series) -> str:
+    """Dirección de la alerta con su evidencia: t de λ⁺ − λ⁻ (impacto) y z del sesgo de profundidad (libro)."""
+    def num(v):
+        return f"{v:+.1f}" if np.isfinite(v) else "—"
+    return (f"{FLECHAS.get(r['direccion'], r['direccion'])} "
+            f"(t λ⁺−λ⁻ {num(r['t_asimetria'])}, z libro {num(r['sesgo_libro_z'])})")
 
 
 def imprimir_auditoria(res: dict, df: pd.DataFrame, alertas: pd.DataFrame, cfg: Config) -> None:
@@ -1326,6 +1395,14 @@ def _romper_huecos(idx: pd.DatetimeIndex, y: np.ndarray, hueco_ns: int):
     return s.index, s.to_numpy()
 
 
+def _sin_cruzar_huecos(idx: pd.DatetimeIndex, mascara: np.ndarray, hueco_ns: int) -> np.ndarray:
+    """Para fill_between(step="post"): la última barra antes de un hueco (fin de semana, pausa) no se
+    extiende sobre el hueco."""
+    t = idx.as_unit("ns").asi8
+    antes_de_hueco = np.r_[np.diff(t) > hueco_ns, False]
+    return np.asarray(mascara, dtype=bool) & ~antes_de_hueco
+
+
 def _estilo_ejes(ejes, C):
     for ax in np.ravel(ejes):
         ax.set_facecolor(C["fondo"])
@@ -1360,26 +1437,27 @@ def graficar_dashboard(df: pd.DataFrame, alertas: pd.DataFrame, cfg: Config, rut
 
     episodio = (df.get("episodio", pd.Series(0, index=df.index)) > 0).to_numpy()
     for ax in ejes:
-        ax.fill_between(idx, 0, 1, where=episodio, transform=ax.get_xaxis_transform(),
-                        color=C["aviso"], alpha=0.22, linewidth=0, step="post")
+        ax.fill_between(idx, 0, 1, where=_sin_cruzar_huecos(idx, episodio, hueco),
+                        transform=ax.get_xaxis_transform(), color=C["aviso"], alpha=0.22, linewidth=0, step="post")
 
     # --- 1) Microprice + alertas por dirección ---
     ax = ejes[0]
     linea(ax, "referencia", color=C["tinta"], linewidth=0.9)
-    marcas = {"alza": ("^", C["alza"], "alerta: vulnerable al alza"),
-              "baja": ("v", C["baja"], "alerta: vulnerable a la baja"),
-              "neutral": ("D", C["tinta2"], "alerta: simétrica")}
+    marcas = {"alza": ("^", C["alza"], C["fondo"], "alerta: vulnerable al alza"),
+              "baja": ("v", C["baja"], C["fondo"], "alerta: vulnerable a la baja"),
+              "neutral": ("D", C["tinta2"], C["fondo"], "alerta: simétrica"),
+              "sin_dato": ("D", C["fondo"], C["tinta2"], "alerta: sin dato de dirección")}
     handles = []
-    for d, (mk, color, etiqueta) in marcas.items():
+    for d, (mk, cara, borde, etiqueta) in marcas.items():
         sub = alertas[alertas["direccion"] == d] if len(alertas) else alertas
         if len(sub):
-            ax.scatter(sub.index.tz_convert(TZ_LOCAL), sub["referencia"], marker=mk, s=70, color=color,
-                       edgecolors=C["fondo"], linewidths=2, zorder=4)
-        handles.append(Line2D([], [], ls="none", marker=mk, ms=8, markerfacecolor=color,
-                              markeredgecolor=C["fondo"], label=etiqueta))
+            ax.scatter(sub.index.tz_convert(TZ_LOCAL), sub["referencia"], marker=mk, s=70, facecolors=cara,
+                       edgecolors=borde, linewidths=2 if borde == C["fondo"] else 1.5, zorder=4)
+        handles.append(Line2D([], [], ls="none", marker=mk, ms=8, markerfacecolor=cara,
+                              markeredgecolor=borde, label=etiqueta))
     handles.append(Patch(facecolor=C["aviso"], alpha=0.4, label="episodio de vacío confirmado"))
     ax.set_ylabel("Microprice" if df["wmid"].notna().any() else "Último trade", color=C["tinta2"])
-    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1.0), ncols=4, frameon=False,
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1.0), ncols=5, frameon=False,
               fontsize=9, labelcolor=C["tinta2"])
 
     # --- 2) λ con IC 95% y λ típico de esa hora ---
@@ -1419,24 +1497,37 @@ def graficar_dashboard(df: pd.DataFrame, alertas: pd.DataFrame, cfg: Config, rut
     ax.legend(loc="upper left", frameon=True, facecolor=C["fondo"], edgecolor="none", framealpha=0.9, fontsize=8,
               ncols=3, labelcolor=C["tinta2"])
 
-    # --- 4) Direccionalidad: asimetría (λ⁺ − λ⁻)/(λ⁺ + λ⁻) ---
+    # --- 4) Direccionalidad: evidencia de impacto (t de λ⁺ − λ⁻) y del libro (z del sesgo bid/ask) ---
+    # Antes se graficaba la asimetría (λ⁺ − λ⁻)/(λ⁺ + λ⁻), que no dice si cruza el umbral; aquí se ve directo.
     ax = ejes[3]
-    t, a = _romper_huecos(idx, df["asimetria"].to_numpy(dtype=float), hueco)
-    ax.fill_between(t, 0, a, where=a > 0, color=C["alza"], alpha=0.35, linewidth=0, interpolate=True)
-    ax.fill_between(t, 0, a, where=a < 0, color=C["baja"], alpha=0.35, linewidth=0, interpolate=True)
+    dir_b = df["direccion"].to_numpy()
+    for d, color in (("alza", C["alza"]), ("baja", C["baja"])):
+        ax.fill_between(idx, 0, 1, where=_sin_cruzar_huecos(idx, dir_b == d, hueco),
+                        transform=ax.get_xaxis_transform(), color=color, alpha=0.10, linewidth=0, step="post")
+    linea(ax, "t_asimetria", color=C["s1"], linewidth=0.8)
+    linea(ax, "sesgo_libro_z", color=C["s3"], linewidth=0.8, alpha=0.85)
+    for u, color in ((cfg.t_direccion, C["s1"]), (cfg.z_libro_direccion, C["s3"])):
+        for signo in (1, -1):
+            ax.axhline(signo * u, color=color, linewidth=0.9, linestyle=(0, (4, 3)))
     ax.axhline(0, color=C["eje"], linewidth=0.8)
-    ax.set_ylim(-1, 1)
-    ax.set_ylabel("asimetría λ⁺/λ⁻", color=C["tinta2"])
-    ax.legend(handles=[Patch(facecolor=C["alza"], alpha=0.5, label="comprar mueve más: ask delgado"),
-                       Patch(facecolor=C["baja"], alpha=0.5, label="vender mueve más: bid delgado")],
-              loc="upper left", frameon=False, fontsize=8, ncols=2, labelcolor=C["tinta2"])
+    serie_dir = pd.concat([df["t_asimetria"], df["sesgo_libro_z"]]).abs().dropna()
+    lim = float(np.nanpercentile(serie_dir, 99.5)) * 1.1 if len(serie_dir) else 4.0
+    lim = min(8.0, max(max(cfg.t_direccion, cfg.z_libro_direccion) + 1.5, lim))
+    ax.set_ylim(-lim, lim)
+    ax.set_ylabel("dirección (z)", color=C["tinta2"])
+    ax.legend(handles=[Line2D([], [], color=C["s1"], lw=2, label="impacto: t de λ⁺ − λ⁻"),
+                       Line2D([], [], color=C["s3"], lw=2, label="libro: z de log(prof bid / prof ask)"),
+                       Patch(facecolor=C["alza"], alpha=0.3, label="+ ask delgado: vulnerable al alza"),
+                       Patch(facecolor=C["baja"], alpha=0.3, label="− bid delgado: vulnerable a la baja")],
+              loc="upper left", frameon=True, facecolor=C["fondo"], edgecolor="none", framealpha=0.9, fontsize=8,
+              ncols=4, labelcolor=C["tinta2"])
 
     # --- 5) Calidad: t de Newey-West y barras descartadas ---
     ax = ejes[4]
     linea(ax, "t_hac", color=C["tinta2"], linewidth=0.8)
     ax.axhline(cfg.t_min, color=C["tinta"], linewidth=0.9, linestyle=(0, (4, 3)))
-    ax.fill_between(idx, 0, 1, where=(~df["valido"]).to_numpy(), transform=ax.get_xaxis_transform(),
-                    color=C["tenue"], alpha=0.18, linewidth=0, step="post")
+    ax.fill_between(idx, 0, 1, where=_sin_cruzar_huecos(idx, (~df["valido"]).to_numpy(), hueco),
+                    transform=ax.get_xaxis_transform(), color=C["tenue"], alpha=0.18, linewidth=0, step="post")
     if df["t_hac"].notna().any():
         ax.set_ylim(0, float(np.nanpercentile(df["t_hac"], 99)) * 1.15)
     ax.set_ylabel("t Newey-West", color=C["tinta2"])
@@ -1446,13 +1537,16 @@ def graficar_dashboard(df: pd.DataFrame, alertas: pd.DataFrame, cfg: Config, rut
 
     memoria = (f"vida media {cfg.vida_media_h:g} h" if cfg.ponderacion == "exponencial"
                else f"ventana {cfg.ventana_h:g} h")
-    fig.text(0.07, 0.975, f"{cfg.symbol} · KYLAMBA v4 · λ de Kyle con microprice · barras de {cfg.barra_min} min · "
+    cuenta = alertas["direccion"].value_counts() if len(alertas) else pd.Series(dtype=int)
+    resumen_dir = (f" (▲ {cuenta.get('alza', 0)} · ▼ {cuenta.get('baja', 0)} · ◆ {cuenta.get('neutral', 0)})"
+                   if len(alertas) else "")
+    fig.text(0.07, 0.975, f"{cfg.symbol} · KYLAMBA v4.1 · λ de Kyle con microprice · barras de {cfg.barra_min} min · "
              f"regresión dinámica ({memoria}) sobre {'OFI' if cfg.regresor == 'ofi' else 'volumen neto'}",
              ha="left", va="top", fontsize=14, fontweight="bold", color=C["tinta"])
     fig.text(0.07, 0.952, f"{idx[0]:%d-%m %H:%M} → {idx[-1]:%d-%m %H:%M} CDMX · z {cfg.normalizacion} "
              f"(franjas de {cfg.franja_min} min, {cfg.dias_norm} días) · filtros: t ≥ {cfg.t_min:g}, R² ≥ "
              f"{cfg.r2_min:g}, n_eff ≥ {cfg.n_eff_min:g}, apalancamiento ≤ {cfg.apalancamiento_max:.0%} · "
-             f"confirmación {cfg.confirmacion} · {len(alertas)} alertas",
+             f"confirmación {cfg.confirmacion} · {len(alertas)} alertas{resumen_dir}",
              ha="left", va="top", fontsize=10, color=C["tinta2"])
     _guardar_figura(fig, ruta_png, mostrar)
 
@@ -1559,7 +1653,7 @@ def graficar_auditoria(res: dict, cfg: Config, ruta_png: Path, mostrar: bool = T
     ax.set_title("Correlación de rangos del z de λ con lo que viene", loc="left", fontsize=11, color=C["tinta"])
     ax.set_ylabel("IC de Spearman", color=C["tinta2"])
 
-    fig.text(0.07, 0.965, f"{cfg.symbol} · KYLAMBA v4 · Auditoría de impacto posterior",
+    fig.text(0.07, 0.965, f"{cfg.symbol} · KYLAMBA v4.1 · Auditoría de impacto posterior",
              ha="left", va="top", fontsize=14, fontweight="bold", color=C["tinta"])
     fig.text(0.07, 0.935, "Todo lo que se evalúa ocurre DESPUÉS del cierre de la barra que generó la medición: "
              "la auditoría es fuera de muestra por construcción.", ha="left", va="top", fontsize=10,
@@ -1656,6 +1750,7 @@ def generar_sintetico(dias: int = 20, inicio: str = "2026-08-03", semilla: int =
     prof = np.where(rth, prof_rth, prof_noche)
     p_sp2 = np.where(rth, 0.02, 0.10)
     mult_c, mult_v = np.ones(n), np.ones(n)
+    k_bid, k_ask = np.ones(n), np.ones(n)               # profundidad relativa de cada lado del libro
     en_vacio = np.zeros(n, bool)
     for ini, fin, lado, mlt in vacios:
         m = (t >= pd.Timestamp(ini).value) & (t < pd.Timestamp(fin).value)
@@ -1664,6 +1759,12 @@ def generar_sintetico(dias: int = 20, inicio: str = "2026-08-03", semilla: int =
             mult_c[m] *= mlt
         if lado in ("ambos", "bid"):
             mult_v[m] *= mlt
+        # la profundidad total cae a 1/3 en todo vacío; en uno de un solo lado, ese lado queda con la mitad
+        # de la del otro (ask delgado = comprar mueve más)
+        if lado == "ask":
+            k_bid[m], k_ask[m] = 4 / 3, 2 / 3
+        elif lado == "bid":
+            k_bid[m], k_ask[m] = 2 / 3, 4 / 3
     prof = np.where(en_vacio, prof / 3, prof)
     p_sp2 = np.where(en_vacio, 0.6, p_sp2)
 
@@ -1687,6 +1788,8 @@ def generar_sintetico(dias: int = 20, inicio: str = "2026-08-03", semilla: int =
         total = np.maximum(4, np.round(2 * prof * rng.lognormal(0, 0.25, n))).astype(np.int64)
         qb = np.maximum(1, np.round(f * total)).astype(np.int64)
         qa = np.maximum(1, total - qb)
+        qb = np.maximum(1, np.round(qb * k_bid)).astype(np.int64)
+        qa = np.maximum(1, np.round(qa * k_ask)).astype(np.int64)
         return bid, bid + s * tick, qb, qa
 
     b_pre, a_pre, qb_pre, qa_pre = libro(m_pre)
@@ -1751,7 +1854,7 @@ def comparar_con_verdad(alertas: pd.DataFrame, verdad: dict, tolerancia_min: flo
     """Solo para la demo: qué vacíos inyectados se detectaron y cuántas alertas fueron falsas."""
     vac = verdad["vacios"]
     tol = pd.Timedelta(minutes=tolerancia_min)
-    detectados, verdaderas, dir_ok, dir_n = 0, set(), 0, 0
+    detectados, verdaderas, dir_ok, dir_n, sim_ok, sim_n = 0, set(), 0, 0, 0, 0
     for _, v in vac.iterrows():
         dentro = alertas[(alertas.index >= v["inicio"]) & (alertas.index <= v["fin"] + tol)]
         if len(dentro):
@@ -1761,8 +1864,12 @@ def comparar_con_verdad(alertas: pd.DataFrame, verdad: dict, tolerancia_min: flo
             if esperado:
                 dir_n += 1
                 dir_ok += int(dentro["direccion"].iloc[0] == esperado)
+            else:
+                sim_n += 1
+                sim_ok += int(dentro["direccion"].iloc[0] not in ("alza", "baja"))
     return {"vacios": len(vac), "detectados": detectados, "alertas": len(alertas),
-            "falsas": len(alertas) - len(verdaderas), "direccion_correcta": dir_ok, "direccion_evaluable": dir_n}
+            "falsas": len(alertas) - len(verdaderas), "direccion_correcta": dir_ok, "direccion_evaluable": dir_n,
+            "simetricos_sin_direccion": sim_ok, "simetricos": sim_n}
 
 
 # =============================================================================
@@ -1976,7 +2083,7 @@ class SesionLive:
                 imprimir_alertas(alertas.iloc[[-1]], self.cfg)
                 carpeta = _ruta(self.cfg.salida_dir)
                 carpeta.mkdir(parents=True, exist_ok=True)
-                ruta = carpeta / "alertas_live.csv"
+                ruta = carpeta / "alertas_live_v41.csv"     # v4.1 agrega columnas: archivo nuevo
                 alertas.iloc[[-1]].to_csv(ruta, mode="a", header=not ruta.exists())
 
 
@@ -2100,7 +2207,8 @@ def main(argv: list[str] | None = None) -> dict:
         auditoria["demo"] = r
         print(f"\n🧪 Verdad conocida: se inyectaron {r['vacios']} vacíos; se detectaron {r['detectados']} · "
               f"alertas falsas: {r['falsas']} de {r['alertas']} · dirección correcta en "
-              f"{r['direccion_correcta']} de {r['direccion_evaluable']} vacíos de un solo lado.")
+              f"{r['direccion_correcta']} de {r['direccion_evaluable']} vacíos de un solo lado · sin dirección "
+              f"falsa en {r['simetricos_sin_direccion']} de {r['simetricos']} vacíos de ambos lados.")
 
     sufijo = _nombre_seguro(cfg.symbol, f"{df.index[0]:%Y%m%d}", f"{df.index[-1]:%Y%m%d}", f"{cfg.barra_min}min")
     carpeta = guardar_resultados(df, alertas, auditoria, cfg, sufijo)
