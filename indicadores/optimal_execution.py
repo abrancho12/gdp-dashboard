@@ -1064,7 +1064,12 @@ def barras_ohlcv(tienda, cfg: Config) -> pd.DataFrame:
                                     "vol": arr["volume"].astype(float)[ok], "inst": inst[ok]}))
     if not partes:
         return pd.DataFrame()
-    b = pd.concat(partes).groupby("m").agg(close=("close", "last"), vol=("vol", "sum"), inst=("inst", "last"))
+    todo = pd.concat(partes)
+    varios = todo.groupby("m")["inst"].nunique()
+    if len(varios) and (varios > 1).mean() > 0.01:
+        sys.exit(f"❌ El OHLCV-1m trae varios contratos a la vez ({(varios > 1).mean():.0%} de los minutos).\n"
+                 "   Usa simbología continua (NQ.n.0, como la descarga por omisión) o filtra un solo contrato.")
+    b = todo.groupby("m").agg(close=("close", "last"), vol=("vol", "sum"), inst=("inst", "last"))
     t = b.index.to_numpy().astype(np.int64) * NS_MIN
     b["t"] = t
     b["sesion"], b["seg"] = reloj_sesion(t, cfg.tz_mercado)
@@ -1634,7 +1639,7 @@ def _a_opt(nm: str, v: float) -> float:
 
 
 def _de_opt(nm: str, x: float) -> float:
-    return math.exp(x) if nm in LOG_ESCALA else x
+    return math.exp(min(max(x, -700.0), 700.0)) if nm in LOG_ESCALA else x
 
 
 def _cotas_opt(nm: str) -> tuple[float, float]:
@@ -1866,7 +1871,7 @@ def errores_estandar(aj: Ajuste, vero: Verosimilitud, base: dict, jackknife: boo
         V = R * np.outer(d, d)
     w, Q = np.linalg.eigh((V + V.T) / 2)
     V = (Q * np.maximum(w, 0.0)) @ Q.T
-    aj.V, aj.nombres_v = V, nombres
+    aj.V, aj.nombres_v = (V if def_pos else None), nombres
     tq = t_cuantil(0.975, G - 1) if G > 1 else np.nan
     for j, nm in enumerate(nombres):
         der = 1.0 if nm == "A" or nm not in LOG_ESCALA else _de_opt(nm, x0[j])
@@ -1965,11 +1970,13 @@ def perfil_delta(obs: Observaciones, aj: Ajuste, vero: Verosimilitud, rejilla: n
     COMPUESTA (los eventos no son independientes), el LR se escala por ĉ = V_robusta/V_hessiano de δ y
     se compara con ĉ·t²(G−1, 0.975) para el IC.
     """
+    lo_d, hi_d = COTAS["delta"]
+    se_r, se_h = aj.se.get("delta", np.nan), aj.se_hess.get("delta", np.nan)
+    c0 = (se_r / se_h) ** 2 if (np.isfinite(se_r) and np.isfinite(se_h) and se_h > 0) else 1.0
+    c0 = max(c0, 1.0)
+    medio = max(np.nanmax([se_r, se_h, 0.0]), 0.01) * 2.0 * math.sqrt(c0)
     if rejilla is None:
-        se = aj.se.get("delta", np.nan)
-        se = se if np.isfinite(se) and se > 0 else 0.05
-        lo, hi = COTAS["delta"]
-        fina = np.clip(aj.p["delta"] + se * np.linspace(-4, 4, 13), lo, hi)
+        fina = np.clip(aj.p["delta"] + medio * np.linspace(-2, 2, 13), lo_d, hi_d)
         rejilla = np.unique(np.round(np.r_[fina, 0.5, 1.0], 4))
     filas = []
     inicio = dict(aj.p)
@@ -1979,11 +1986,28 @@ def perfil_delta(obs: Observaciones, aj: Ajuste, vero: Verosimilitud, rejilla: n
                     vero=Verosimilitud(obs, esp, aj.x_ref, vero.flujo))
         inicio = dict(a.p)
         filas.append({"delta": float(d), "ll": a.ll, "A": a.A})
-    T = pd.DataFrame(filas)
-    c = (aj.se.get("delta", np.nan) / aj.se_hess.get("delta", np.nan)) ** 2 if aj.se_hess.get("delta") else 1.0
-    c = max(c, 1.0) if np.isfinite(c) else 1.0
+    c = c0
+    u = t_cuantil(0.975, max(aj.sesiones - 1, 1)) ** 2
+    # si un lado no llega al umbral, se extiende la rejilla de ese lado (hasta la cota)
+    for _ in range(4):
+        T = pd.DataFrame(filas)
+        lr = np.maximum(2 * (aj.ll - T["ll"]) / c, 0.0)
+        nuevos = []
+        abajo, arriba = T["delta"] < aj.p["delta"], T["delta"] > aj.p["delta"]
+        if not (lr[abajo] > u).any() and T["delta"].min() > lo_d + 1e-6:
+            nuevos.append(max(T["delta"].min() - 2 * medio, lo_d))
+        if not (lr[arriba] > u).any() and T["delta"].max() < hi_d - 1e-6:
+            nuevos.append(min(T["delta"].max() + 2 * medio, hi_d))
+        if not nuevos:
+            break
+        for d in nuevos:
+            esp = Especificacion(f"δ = {d}", vero.esp.media, tuple(list(vero.esp.fijos) + [("delta", float(d))]), vero.esp.dist)
+            a = ajustar(obs, esp, aj.x_ref, vero.flujo, inicio=dict(aj.p), errores=False,
+                        vero=Verosimilitud(obs, esp, aj.x_ref, vero.flujo))
+            filas.append({"delta": float(d), "ll": a.ll, "A": a.A})
+    T = pd.DataFrame(filas).sort_values("delta").reset_index(drop=True)
     T["lr"] = np.maximum(2 * (aj.ll - T["ll"]) / c, 0.0)
-    T.attrs["umbral"] = u = t_cuantil(0.975, max(aj.sesiones - 1, 1)) ** 2
+    T.attrs["umbral"] = u
     T.attrs["c"] = c
     # IC: donde el LR cruza el umbral, interpolando a cada lado de δ̂
     d, lr = T["delta"].to_numpy(), T["lr"].to_numpy()
@@ -2145,6 +2169,7 @@ class Mercado:
     clip_s: float
     slice_s: float
     slot_s: float
+    tope: np.ndarray | None = None    # contratos máximos por slice: part_max del volumen pronosticado
 
     @property
     def C(self) -> int:
@@ -2194,8 +2219,9 @@ def mercado(dia: int, perf: Perfiles, spreads: pd.DataFrame, cfg: Config, clip_s
     w_min = vol[slot_min_] / cfg.slot_min
     w_min = w_min / w_min.sum() if w_min.sum() > 0 else np.full(len(minutos), 1 / len(minutos))
     w = w_min.reshape(N, -1).sum(axis=1) if len(minutos) == N * cfg.slice_min else np.full(N, 1 / N)
+    r = cfg.part_max / (1.0 - cfg.part_max)               # ser part_max del TOTAL = r × el volumen de los demás
     return Mercado(dia, t0, t1, N, m, t_clip, slot_clip, sig, vol, spr, w, w_min, V_hor, clip_s, slice_s,
-                   cfg.slot_min * 60.0)
+                   cfg.slot_min * 60.0, r * w * V_hor if V_hor > 0 else None)
 
 
 @dataclass
@@ -2223,20 +2249,30 @@ class ModeloImpacto:
     kP: float
     c_self: float = 0.5
     pi_original: float = np.nan
+    kq: np.ndarray | None = None      # impacto TOTAL por contrato de cada clip, f̂(q)/q (calibra λ sin depender de π)
 
 
-def modelo_impacto(p: dict, A: float, x_ref: float, mer: Mercado, cfg: Config, c_self: float = 0.5) -> ModeloImpacto:
+PI_MAX = 0.9          # π de EJECUCIÓN: con 100 % permanente todos los planes cuestan igual y el QP apilaría la orden
+
+
+def modelo_impacto(p: dict, A: float, x_ref: float, mer: Mercado, cfg: Config, c_self: float = 0.5,
+                   pi_max: float = PI_MAX) -> ModeloImpacto:
+    """
+    π se recorta a [0, 0.9]: π̂ ≥ 1 (no se vio decaimiento en los horizontes medidos) dejaría κ_T = 0, el
+    costo sería igual para cualquier plan y el ÓPTIMO metería toda la orden en el slice de menor spread. Parte
+    del impacto siempre decae (Bouchaud et al. 2004); el reporte avisa cuando se recorta.
+    """
     escala = 300.0 / (cfg.slot_min * 60)
     sig5 = mer.sig_slot * math.sqrt(escala)
     v5 = np.maximum(mer.vol_slot * escala, 1e-9)
     q = float(cfg.pieza)
-    pi = float(min(max(p["pi"], 0.0), 1.0))
+    pi = float(min(max(p["pi"], 0.0), pi_max))
     tau = float(max(p["tau"], 1.0))
     f = A * sig5 * ((q / v5) / x_ref) ** p["delta"]
     kT = (1 - pi) * f[mer.slot_clip] / q
     slots_h = np.unique(mer.slot_clip)
     f_bar = A * float(np.mean(sig5[slots_h])) * ((q / float(np.mean(v5[slots_h]))) / x_ref) ** p["delta"]
-    return ModeloImpacto(A, p["delta"], pi, tau, x_ref, q, kT, pi * f_bar / q, c_self, p["pi"])
+    return ModeloImpacto(A, p["delta"], pi, tau, x_ref, q, kT, pi * f_bar / q, c_self, p["pi"], f[mer.slot_clip] / q)
 
 
 def matrices(mod: ModeloImpacto, mer: Mercado) -> dict:
@@ -2264,34 +2300,54 @@ def costo_modelo(u: np.ndarray, X: float, M: dict) -> tuple[float, float]:
     return E, math.sqrt(max(float(M["w"] @ (x * x)), 0.0))
 
 
-def qp_simplex(Qn: np.ndarray, bn: np.ndarray, X: float, iters: int = 500) -> tuple[np.ndarray, bool]:
+def qp_simplex(Qn: np.ndarray, bn: np.ndarray, X: float, tope: np.ndarray | None = None,
+               iters: int = 1000) -> tuple[np.ndarray, bool]:
     """
-    min ½nᵀQn + bᵀn  s.a.  Σn = X, n ≥ 0, por conjunto activo con las condiciones KKT exactas (N chico).
-    Devuelve (n, convergió).
+    min ½nᵀQn + bᵀn  s.a.  Σn = X, 0 ≤ n ≤ tope, por conjunto activo con las condiciones KKT exactas (N chico).
+    Si los topes no alcanzan para X se agrandan en proporción. Devuelve (n, convergió).
     """
     N = len(bn)
-    Qn = Qn + 1e-9 * max(float(np.mean(np.abs(np.diag(Qn)))), 1e-300) * np.eye(N)   # Q singular (π = 1): KKT compatible
-    libre = np.ones(N, bool)
+    Qn = Qn + 1e-9 * max(float(np.mean(np.abs(np.diag(Qn)))), 1e-300) * np.eye(N)   # Q singular: KKT compatible
+    hi = np.full(N, np.inf) if tope is None else np.maximum(np.asarray(tope, float), 0.0)
+    if hi.sum() < X:
+        hi = hi * (X / max(hi.sum(), 1e-300)) * (1 + 1e-9) if hi.sum() > 0 else np.full(N, np.inf)
+    estado = np.zeros(N, int)                              # 0 libre · −1 en 0 · +1 en el tope
+    tol = 1e-9 * max(X, 1.0)
     n = np.full(N, X / N)
     for _ in range(iters):
-        F = np.flatnonzero(libre)
+        F, U = np.flatnonzero(estado == 0), np.flatnonzero(estado == 1)
+        if not len(F):
+            estado[U[0] if len(U) else 0] = 0
+            continue
+        resto = X - hi[U].sum()
         k = len(F)
         Mk = np.zeros((k + 1, k + 1))
         Mk[:k, :k] = Qn[np.ix_(F, F)]
         Mk[:k, k] = 1.0
         Mk[k, :k] = 1.0
-        rhs = np.r_[-bn[F], X]
+        rhs = np.r_[-bn[F] - (Qn[np.ix_(F, U)] @ hi[U] if len(U) else 0.0), resto]
         sol = np.linalg.lstsq(Mk, rhs, rcond=None)[0]
         nF, mu = sol[:k], sol[k]
-        if (nF < -1e-9 * max(X, 1)).any():
-            libre[F[int(np.argmin(nF))]] = False
+        bajo, alto = -nF, nF - hi[F]
+        if max(bajo.max(), alto.max()) > tol:              # factibilidad primal: el que más se sale va a su cota
+            if bajo.max() >= alto.max():
+                estado[F[int(np.argmax(bajo))]] = -1
+            else:
+                estado[F[int(np.argmax(alto))]] = 1
             continue
         n = np.zeros(N)
-        n[F] = np.maximum(nF, 0.0)
-        nu = Qn @ n + bn + mu
-        act = np.flatnonzero(~libre)
-        if len(act) and nu[act].min() < -1e-9 * (1 + abs(mu)):
-            libre[act[int(np.argmin(nu[act]))]] = True
+        n[F] = np.clip(nF, 0.0, hi[F])
+        n[U] = hi[U]
+        g = Qn @ n + bn + mu                               # KKT: g ≥ 0 en la cota de abajo, g ≤ 0 en el tope
+        L = np.flatnonzero(estado == -1)
+        peor_l = g[L].min() if len(L) else 0.0
+        peor_u = g[U].max() if len(U) else 0.0
+        umbral = 1e-9 * (1 + abs(mu))
+        if peor_l < -umbral and -peor_l >= peor_u:
+            estado[L[int(np.argmin(g[L]))]] = 0
+            continue
+        if peor_u > umbral:
+            estado[U[int(np.argmax(g[U]))]] = 0
             continue
         return n, True
     return n, False
@@ -2308,7 +2364,8 @@ def optimo_ow(X: float, lam: float, M: dict, mer: Mercado) -> tuple[np.ndarray, 
     """
     ÓPTIMO con resiliencia (Obizhaeva–Wang, linealizado): min E[costo] + λ·Var sobre los tamaños por slice,
     con la dinámica exacta clip a clip (transitorio que decae, permanente, costo propio y spread).
-    Es convexo cuando Q es definida positiva (G convexa y c ≥ ½; Alfonsi, Schied y Slynko 2012).
+    Es convexo cuando Q es definida positiva (G convexa y c ≥ ½; Alfonsi, Schied y Slynko 2012). Cada slice
+    tiene un tope: part_max del volumen PRONOSTICADO (lo que impone cualquier mesa de ejecución).
     """
     B = matriz_reparto(mer)
     L = np.tril(np.ones((mer.C, mer.C)))
@@ -2317,16 +2374,21 @@ def optimo_ow(X: float, lam: float, M: dict, mer: Mercado) -> tuple[np.ndarray, 
     LB = L @ B
     Qn = B.T @ M["Q"] @ B + 2 * lam * (LB.T * W) @ LB
     bn = B.T @ M["b"] - 2 * lam * X * (W @ LB)
-    n, ok = qp_simplex(Qn, bn, X)
+    n, ok = qp_simplex(Qn, bn, X, mer.tope)
     return B @ n, ok
 
 
-def eta_slices(mod: ModeloImpacto, mer: Mercado, M: dict) -> np.ndarray:
+def eta_slices(mod: ModeloImpacto, mer: Mercado, M: dict, total: bool = False) -> np.ndarray:
     """η de cada slice (ticks por contrato², costo = η·n²): el bloque TRANSITORIO del propio slice con flujo parejo."""
     eta = np.zeros(mer.N)
     for k in range(mer.N):
         a, b = k * mer.m, (k + 1) * mer.m
-        blk = np.diag(mod.c_self * mod.kT[a:b]) + M["KT"][a:b, a:b]       # sin el permanente: no distingue planes
+        if total and mod.kq is not None:                    # para λ: el impacto completo, que no depende de π
+            t = (mer.t_clip[a:b] - mer.t_clip[a]) / NS
+            dt = t[:, None] - t[None, :]
+            blk = np.diag(mod.c_self * mod.kq[a:b]) + np.where(dt > 0, mod.kq[a:b][None, :] * np.exp(-np.maximum(dt, 0) / mod.tau), 0.0)
+        else:
+            blk = np.diag(mod.c_self * mod.kT[a:b]) + M["KT"][a:b, a:b]   # sin el permanente: no distingue planes
         eta[k] = float(blk.sum()) / mer.m ** 2
     return eta
 
@@ -2406,8 +2468,7 @@ def realizado(mer: Mercado, E: pd.DataFrame, barras: pd.DataFrame) -> Realizado 
     if j.max() >= len(t_e):
         return None
     ses_e = E["sesion"].to_numpy()
-    jf0 = min(int(np.searchsorted(t_e, mer.t1, side="left")), len(t_e) - 1)
-    if (ses_e[j] != mer.dia).any() or ses_e[jf0] != mer.dia:
+    if (ses_e[j] != mer.dia).any():
         return None                                        # cierre anticipado o hueco: el mid sería de otra sesión
     mid = pd.Series(mid_e[np.minimum(j, len(t_e) - 1)]).ffill().bfill().to_numpy()
     m_ini, m_fin = mer.t0 // NS_MIN, mer.t1 // NS_MIN
@@ -2420,6 +2481,8 @@ def realizado(mer: Mercado, E: pd.DataFrame, barras: pd.DataFrame) -> Realizado 
     k_min = ((mer.t_clip // NS_MIN) - m_ini).astype(int)
     spread = np.where(np.isfinite(spr_min[k_min]), spr_min[k_min], 1.0)
     jf = min(int(np.searchsorted(t_e, mer.t1, side="left")), len(t_e) - 1)
+    if ses_e[jf] != mer.dia:                               # --fin en el cierre: la última operación de la sesión
+        jf -= 1
     d = np.diff(np.r_[mid, mid_e[jf]])
     # varianza realizada por clip: la de su minuto, repartida
     d2 = pd.Series(d * d).groupby(k_min).transform("mean").to_numpy()
@@ -2582,7 +2645,7 @@ def backtest(sesiones: list, ajustes: dict, x_ref: float, perf: Perfiles, spread
         M = matrices(mod, mer)
         if lam is None:
             sig2 = M["w"].reshape(mer.N, mer.m).sum(axis=1)
-            lam = lambda_de_urgencia(cfg.urgencia, eta_slices(mod, mer, M), sig2)
+            lam = lambda_de_urgencia(cfg.urgencia, eta_slices(mod, mer, M, total=True), sig2)
         planes, forzado = _planes(X, mer, mod, M, lam, real, cfg)
         detalle = {}
         for nm, u in planes.items():
@@ -2613,15 +2676,15 @@ def backtest(sesiones: list, ajustes: dict, x_ref: float, perf: Perfiles, spread
     if mer_obj is not None and mer_obj.dia != dia_objetivo(cfg):
         avisos.append(f"la sesión objetivo {cfg.sesion_objetivo} no se pudo replicar (datos incompletos o fuera del "
                       f"archivo): se muestra la {fecha_de_dia(mer_obj.dia):%Y-%m-%d}")
-    if mod_obj is not None and not (0.0 <= mod_obj.pi_original <= 1.0):
-        avisos.append(f"π̂ = {mod_obj.pi_original:.2f} fuera de [0, 1]: para ejecutar se recortó a {mod_obj.pi:.2f}")
+    if mod_obj is not None and not (0.0 <= mod_obj.pi_original <= PI_MAX):
+        avisos.append(f"π̂ = {mod_obj.pi_original:.2f} fuera de [0, {PI_MAX:g}]: para ejecutar se recortó a {mod_obj.pi:.2f}")
     return Backtest(F, planes_obj, mer_obj, mod_obj, lam, fr, par, arr, comp, pico, avisos, real_obj, det_obj, forz_obj)
 
 
 def frontera(X: float, mer: Mercado, mod: ModeloImpacto, M: dict, planes: dict, cfg: Config) -> pd.DataFrame:
     """Frontera eficiente (costo esperado contra desviación) del ÓPTIMO para varias urgencias, y cada algoritmo."""
     sig2 = M["w"].reshape(mer.N, mer.m).sum(axis=1)
-    eta = eta_slices(mod, mer, M)
+    eta = eta_slices(mod, mer, M, total=True)
     filas = []
     for kT in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0):
         lam = lambda_de_urgencia(kT, eta, sig2)
@@ -2641,8 +2704,8 @@ def _modelo_de(x: np.ndarray, nombres: list, base: dict, x_ref: float, mer: Merc
         if nm == "A":
             A = float(v)
         else:
-            lo, hi = COTAS[nm]
-            p[nm] = float(min(max(_de_opt(nm, v), lo), hi))
+            lo, hi = _cotas_opt(nm)
+            p[nm] = float(_de_opt(nm, min(max(v, lo), hi)))
     return modelo_impacto(p, A, x_ref, mer, cfg)
 
 
@@ -2685,7 +2748,7 @@ def arrepentimiento(X: float, mer: Mercado, mod: ModeloImpacto, lam: float, plan
     filas = []
     for nm_alt, cambios in alternativas.items():
         p = {"delta": mod.delta, "pi": cambios.get("pi", mod.pi), "tau": cambios.get("tau", mod.tau)}
-        m2 = modelo_impacto(p, cambios.get("A", mod.A), mod.x_ref, mer, cfg)
+        m2 = modelo_impacto(p, cambios.get("A", mod.A), mod.x_ref, mer, cfg, pi_max=1.0)
         M2 = matrices(m2, mer)
         e_o, sd_o = costo_modelo(optimo_ow(X, lam, M2, mer)[0], X, M2)
         opt = e_o + lam * sd_o ** 2
@@ -3019,7 +3082,7 @@ def plan_siguiente(roll: Rolling, x_ref: float, perf: Perfiles, spreads: pd.Data
     M = matrices(mod, mer)
     X = float(cfg.orden)
     if not lam:
-        lam = lambda_de_urgencia(cfg.urgencia, eta_slices(mod, mer, M), M["w"].reshape(mer.N, mer.m).sum(axis=1))
+        lam = lambda_de_urgencia(cfg.urgencia, eta_slices(mod, mer, M, total=True), M["w"].reshape(mer.N, mer.m).sum(axis=1))
     filas = {}
     resumen = {}
     for nm in ("TWAP", "VWAP", "POV*", "AC", "ÓPTIMO"):
@@ -3153,8 +3216,12 @@ def cordura(res: Resultado) -> list:
         c.append((True, f"decaimiento: g promedio 15-60 s = {gb:.2f} (H0 sin decaimiento, p = {pg:.3f})"))
     cp = res.costo_propio
     if np.isfinite(cp.get("c", np.nan)):
-        c.append((abs(cp["c"] - 0.5) < max(2 * cp["se"], 0.25),
-                  f"costo propio del agresor = {cp['c']:.2f} ± {cp['se']:.2f} × su impacto (el optimizador usa ½)"))
+        if res.verdad is not None:
+            c.append((True, f"costo propio del agresor = {cp['c']:.2f} ± {cp['se']:.2f} × su impacto (el simulador llena al "
+                            "mejor precio: ≈ 0 es lo esperado; con datos reales se compara con el ½ del optimizador)"))
+        else:
+            c.append((abs(cp["c"] - 0.5) < max(2 * cp["se"], 0.25),
+                      f"costo propio del agresor = {cp['c']:.2f} ± {cp['se']:.2f} × su impacto (el optimizador usa ½)"))
     est = res.roll.estabilidad
     if np.isfinite(est.get("p", np.nan)):
         c.append((est["p"] > 0.05, f"estabilidad de A entre sesiones (Nyblom): p = {est['p']:.3f}"))
@@ -3511,7 +3578,7 @@ def reporte_objetivo(res: Resultado) -> None:
     X = float(cfg.orden)
     fecha_r = f"{fecha_de_dia(bt.mercado.dia):%Y-%m-%d}"
     _titulo(f"5 · LA SESIÓN OBJETIVO ({fecha_r}) · {_lado_txt(cfg)} de {cfg.orden:,} · réplica clip a clip")
-    if fecha_r != cfg.sesion_objetivo:
+    if bt.mercado.dia != dia_objetivo(cfg):
         print(f"  ⚠ La sesión pedida ({cfg.sesion_objetivo}) no se pudo replicar: se muestra la última que sí.")
     print(f"  Precio de llegada {bt.real.mid[0] * tick(cfg.symbol):,.2f} · final {bt.real.mid_fin * tick(cfg.symbol):,.2f} · "
           "IS = lado·(precio medio − llegada)")
@@ -4518,6 +4585,11 @@ def config_desde_args(a: argparse.Namespace) -> Config:
             cambios[k] = v
     if a.simbolo:
         cambios["symbol"] = simbolo_continuo(a.simbolo)
+    if a.sesion_objetivo:
+        try:
+            cambios["sesion_objetivo"] = f"{pd.Timestamp(a.sesion_objetivo):%Y-%m-%d}"
+        except ValueError:
+            pass                                           # validar() da el mensaje
     if a.horizontes:
         cambios["horizontes_s"] = tuple(int(x) for x in a.horizontes.split(",") if x.strip())
     if a.lado:
@@ -4532,10 +4604,10 @@ def config_de_archivo(cfg: Config, tienda, con_sesion: bool) -> Config:
     if con_sesion:
         return cfg
     meta = tienda.metadata
-    t1 = int(meta.end) - 1 if meta.end else int(meta.start) + DIA_NS
-    dia, seg = reloj_sesion([t1], cfg.tz_mercado)
+    t1 = int(meta.end) if meta.end else int(meta.start) + DIA_NS          # exclusivo
+    dia, seg = reloj_sesion([t1 - 1], cfg.tz_mercado)                     # el reloj del último ns cubierto
     dia = int(dia[0])
-    if int(seg[0]) < segundo_de_hora(cfg.fin_ct):          # la última sesión no llega al final del horizonte
+    if int(seg[0]) + 1 < segundo_de_hora(cfg.fin_ct):      # la última sesión no llega al final del horizonte
         dia = dias_previos(dia, 1)
     return replace(cfg, sesion_objetivo=f"{fecha_de_dia(dia):%Y-%m-%d}")
 
@@ -4752,7 +4824,7 @@ def pruebas() -> int:
     # 11 ----------------------------------------- QP: factible y nadie lo mejora
     mod_r = modelo_impacto({"delta": 0.5, "pi": 0.4, "tau": 90.0}, 0.03, 0.01, mer, cs)
     M_r = matrices(mod_r, mer)
-    lam_r = lambda_de_urgencia(2.0, eta_slices(mod_r, mer, M_r), M_r["w"].reshape(mer.N, mer.m).sum(axis=1))
+    lam_r = lambda_de_urgencia(2.0, eta_slices(mod_r, mer, M_r, total=True), M_r["w"].reshape(mer.N, mer.m).sum(axis=1))
     u_o, ok_o = optimo_ow(500.0, lam_r, M_r, mer)
     obj = lambda w: costo_modelo(w, 500.0, M_r)[0] + lam_r * costo_modelo(w, 500.0, M_r)[1] ** 2   # noqa: E731
     B = matriz_reparto(mer)
@@ -4763,12 +4835,38 @@ def pruebas() -> int:
           ok_o and abs(u_o.sum() - 500) < 1e-6 and u_o.min() > -1e-9 and obj(u_o) <= min(mejor, otros) + 1e-9)
     planes_r = {nm: plan_estatico(nm, 500.0, mer, mod_r, M_r, lam_r) for nm in ("TWAP", "VWAP", "AC", "ÓPTIMO")}
     arr_r = arrepentimiento(500.0, mer, mod_r, lam_r, planes_r, cs)
-    mod_1 = modelo_impacto({"delta": 0.5, "pi": 1.0, "tau": 90.0}, 0.03, 0.01, mer, cs)
-    M_1 = matrices(mod_1, mer)
-    e_1 = costo_modelo(optimo_ow(500.0, 0.0, M_1, mer)[0], 500.0, M_1)[0]
+    mer_s = replace(mer, tope=None)
+    mod_1 = modelo_impacto({"delta": 0.5, "pi": 1.0, "tau": 90.0}, 0.03, 0.01, mer_s, cs, pi_max=1.0)
+    M_1 = matrices(mod_1, mer_s)
+    e_1 = costo_modelo(optimo_ow(500.0, 0.0, M_1, mer_s)[0], 500.0, M_1)[0]
     e_min = min(costo_modelo(B @ (500.0 * np.eye(mer.N)[k]), 500.0, M_1)[0] for k in range(mer.N))
     check("arrepentimiento ≥ 0 en E + λ·Var y el QP resuelve el caso singular (π = 1, λ = 0)",
           arr_r["arrepentimiento"].min() > -1e-9 and e_1 <= e_min + 1e-6 * abs(e_min))
+    # π̂ = 1.5 (en la cota): π de ejecución 0.9, λ > 0 sin importar π y el ÓPTIMO respeta el tope por slice
+    mod_c = modelo_impacto({"delta": 0.5, "pi": 1.5, "tau": 90.0}, 0.03, 0.01, mer, cs)
+    M_c = matrices(mod_c, mer)
+    lam_c = lambda_de_urgencia(1.0, eta_slices(mod_c, mer, M_c, total=True), M_c["w"].reshape(mer.N, mer.m).sum(axis=1))
+    lam_d = lambda_de_urgencia(1.0, eta_slices(mod_r, mer, M_r, total=True), M_r["w"].reshape(mer.N, mer.m).sum(axis=1))
+    n_c = optimo_ow(2000.0, lam_c, M_c, mer)[0].reshape(mer.N, mer.m).sum(axis=1)
+    check("π̂ en la cota: π de ejecución 0.9, la urgencia no depende de π y el ÓPTIMO respeta el tope de participación",
+          mod_c.pi == PI_MAX and abs(lam_c - lam_d) < 1e-9 * max(abs(lam_d), 1e-300) and lam_c > 0
+          and np.all(n_c <= mer.tope * (1 + 1e-6) + 1e-6) and (n_c > 0).sum() > mer.N // 4,
+          f"slice máximo {n_c.max():.0f} de tope {mer.tope.max():.0f}")
+    # QP con cajas: KKT en un problema al azar
+    rng_q = np.random.default_rng(3)
+    Aq = rng_q.standard_normal((12, 12))
+    Qq, bq, hq = Aq @ Aq.T + 0.1 * np.eye(12), rng_q.standard_normal(12) * 5, rng_q.uniform(5, 20, 12)
+    nq, okq = qp_simplex(Qq, bq, 100.0, hq)
+    gq = Qq @ nq + bq
+    libres_q = (nq > 1e-7) & (nq < hq - 1e-7)
+    mu_q = -float(np.mean(gq[libres_q])) if libres_q.any() else 0.0
+    rq = gq + mu_q
+    tq_ = 1e-6 * (1 + np.abs(gq).max())
+    kkt = (np.all(np.abs(rq[libres_q]) < tq_) and np.all(rq[nq <= 1e-7] > -tq_) and np.all(rq[nq >= hq - 1e-7] < tq_))
+    check("QP con topes: suma la orden, respeta 0 ≤ n ≤ tope y cumple KKT",
+          okq and abs(nq.sum() - 100) < 1e-6 and nq.min() > -1e-9 and np.all(nq <= hq + 1e-9) and kkt
+          and (nq >= hq - 1e-7).any())
+
 
     # 12-13 -------------------------------------- réplica: atribución exacta y compra/venta
     real = realizado(mer, E, barras)
@@ -4780,6 +4878,9 @@ def pruebas() -> int:
     E_sig = E[~((E["sesion"] == d) | ((E["sesion"] == d_prev) & (E["seg"] >= segundo_de_hora("12:00"))))].reset_index(drop=True)
     check("una sesión cortada a mediodía (cierre anticipado) no se replica con precios de la sesión siguiente",
           realizado(mer, E_corta, b_corta) is None and realizado(mer_p, E_sig, barras) is None and real is not None)
+    c16 = replace(cs, inicio_ct="15:00", fin_ct="16:00")
+    ok16 = realizado(mercado(d_prev, perf, spreads, c16), E, barras) is not None
+    check("con --fin 16:00 (el cierre) una sesión intermedia sí se replica", ok16)
     r1 = ejecutar(u_o, 1, mer, mod_r, M_r, real)
     r2 = ejecutar(u_o, -1, mer, mod_r, M_r, real)
     suma = sum(r1[k] for k in ("spread", "propio", "transitorio", "permanente", "timing", "comisiones"))
