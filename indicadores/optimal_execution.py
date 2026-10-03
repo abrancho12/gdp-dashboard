@@ -1,6 +1,237 @@
 # -*- coding: utf-8 -*-
 """
-DOCSTRING_PENDIENTE
+OPTIMAL EXECUTION AC v1 — Cuánto mueve el precio una orden grande (MLE sobre los large trades
+institucionales) y cómo ejecutar la tuya: TWAP, VWAP, POV, Almgren–Chriss y el ÓPTIMO con resiliencia
+Datos: Databento GLBX.MDP3 · TBBO (cada operación con el mejor bid/ask JUSTO ANTES) + OHLCV-1m.
+
+Qué hace, en una línea: encuentra los prints institucionales grandes de las sesiones anteriores,
+mide con máxima verosimilitud cuánto mueve el precio una orden según su tamaño RELATIVO a la
+liquidez de esa hora, qué parte se queda y en cuánto tiempo se va el resto, y con ese modelo ejecuta
+cada algoritmo en sesiones PASADAS con lo que se sabía antes de cada una. Te dice cuál cuesta menos,
+cuál arriesga menos, si la diferencia es real y cómo repartir la orden de mañana.
+
+LO QUE PEDISTE, HECHO A FONDO
+
+  1. EXTRACCIÓN DE EVENTOS CLAVE. Usa el motor del Rastreador de ID: el EVENTO es la orden
+     agresiva tal como la casó CME (mismo ts_event, agresor y contrato) y la HUELLA junta las del
+     mismo lado a ≤ 100 ms. Un EVENTO CLAVE es una huella ≥ p95 de las 5 sesiones ANTERIORES en el
+     horario regular, con libro previo. De cada uno guarda:
+       · el lado del agresor, Q, el mid y el spread JUSTO ANTES del primer evento (la referencia);
+       · Q/V₅, su participación en el volumen que se esperaba en esos 5 minutos a esa hora, y σ₅, la
+         volatilidad esperada a esa hora. Las dos salen de perfiles de las sesiones anteriores;
+       · el mid a 0, 5, 15, 30, 60, 120, 300, 600 y 1800 s después, con su tiempo REAL (el siguiente
+         libro puede llegar segundos después), sin cruzar el cierre ni un roll y menos la deriva de la
+         sesión (en un día de tendencia las grandes van con la tendencia y se disfrazaría de impacto).
+
+  2. AJUSTE MATEMÁTICO DEL MODELO (MLE). Para cada evento clave y horizonte h:
+         lado·Δmid(h) = A·σ₅·Σₑ((qₑ/V₅)/x_ref)^δ · [π + (1 − π)·e^(−h/τ)] + ruido
+       · δ: la forma de la curva (0.5 = raíz cuadrada, 1 = lineal). La suma es sobre las órdenes de la
+         huella: con δ < 1 dos órdenes de 10 mueven más que una de 20;
+       · π: la parte permanente; τ: en cuántos segundos se va la transitoria;
+       · covarianza κ²·V(difusión con la U intradía) + ω²·(microestructura, compartida por el mid de
+         referencia) + ϕ²·(dispersión extra del horizonte 0), con los tiempos reales de cada observación.
+     QMLE gaussiano: A sale por GLS cerrado y los no lineales se optimizan por bloques (la media y la
+     covarianza son casi ortogonales) con L-BFGS-B, o con un Nelder–Mead propio si no tienes scipy.
+     Errores estándar robustos: el mayor entre el sándwich agrupado por SESIÓN (CR1) y el jackknife que
+     quita una sesión a la vez (CV3), con t de G − 1 gl. Además:
+       · 5 modelos: respuesta (δ libre), PROPAGADOR (el impacto de TODAS las huellas superpuesto, como
+         Bouchaud et al.: no le atribuye a la grande el flujo que vino después), raíz (δ = 0.5), lineal
+         (δ = 1) y respuesta con errores t. Se comparan con CLAIC (AIC de verosimilitud compuesta);
+       · Wald robusto de δ = 0.5 y δ = 1, y el perfil de verosimilitud de δ escalado por ĉ;
+       · la curva SEMIPARAMÉTRICA: g(h) por GLS sin forma funcional, contra G(h) ajustado, y la prueba
+         de que el impacto decae (g de 15-60 s contra 1);
+       · el costo propio del agresor (lo que pagó contra el mid contra su impacto ajustado);
+       · el PIT de las distancias de Mahalanobis: ¿la covarianza del modelo cuadra con los datos?
+
+  3. ANÁLISIS DINÁMICO (ROLLING). Para cada sesión, con lo que se sabía ANTES de ella:
+       · A —lo único bien identificado— con las últimas 5 sesiones, por GLS, con su IC por sesión;
+       · δ, π, τ, ω, κ, ϕ con TODAS las sesiones anteriores (con 3-5 serían ruido);
+       · A por hora del día y la prueba de estabilidad de Nyblom con p por permutación.
+     La última fila es la de MAÑANA: con ella sale el plan.
+
+  4. DASHBOARD VISUAL CUÁDRUPLE (2×2, PNG):
+       (a) la sesión objetivo: el mid con los LARGE TRADES institucionales (burbuja = contratos, azul
+           compra, rojo venta, borde negro MEGA o BALLENA), el VWAP del mercado, el precio de llegada,
+           el precio medio de la ejecución del ÓPTIMO y, abajo, el volumen del mercado y el nuestro;
+       (b) el ajuste MLE: impacto inicial contra Q/V₅ (empírico con IC por sesión contra δ libre, raíz y
+           lineal) y el decaimiento g(h) con IC contra G(h) de la respuesta y del propagador;
+       (c) el rolling: A con su IC 95 % y δ, π, τ sesión por sesión;
+       (d) el inventario que falta en cada algoritmo y el costo de cada uno contra TWAP en el
+           walk-forward, con IC pareado, veredicto y riesgo.
+     Más un tablero de AUDITORÍA de 12 paneles: perfil de δ, PIT de la covarianza, CLAIC, A por hora,
+     frontera eficiente, IS de cada sesión, atribución del costo, incertidumbre de los parámetros,
+     perfil de volumen pronosticado contra realizado, arrepentimiento, participación por minuto y
+     chequeo de cordura.
+
+  5. LOS ALGORITMOS, ejecutados igual para todos sobre una rejilla de clips de 20 s:
+       TWAP     partes iguales por slice de 5 min.
+       VWAP     con el perfil de volumen de las sesiones ANTERIORES (no el del día que se ejecuta).
+       POV      el 10 % del volumen REAL con 1 minuto de rezago (ρ/(1 − ρ) del resto); si no termina,
+                el remanente se fuerza al final y se reporta.
+       POV*     la ρ que termina al final del horizonte en promedio.
+       AC       Almgren–Chriss con η y σ por franja (sistema tridiagonal exacto).
+       ÓPTIMO   E[costo] + λ·Var con impacto que DECAE (Obizhaeva–Wang): transitorio con la liquidez
+                de cada hora, permanente constante y costo propio de ½, por programación cuadrática
+                con la dinámica clip a clip y un TOPE por slice (25 % del volumen pronosticado). λ sale
+                de la urgencia κT con el impacto total (no depende de π̂) y queda FIJA todo el backtest.
+     El modelo de ejecución es LINEAL en el tamaño del clip, con f̂(q) del MLE: con impacto de potencia,
+     parte permanente y decaimiento el costo deja de ser convexo y se puede "manipular" (Gatheral 2010).
+     π se recorta a [0, 0.9] para ejecutar: con 100 % permanente todos los planes cuestan lo mismo y
+     el QP metería la orden entera en el slice de menor spread (en una simulación eso costó 2.7 t/c).
+     Cada plan se replica clip a clip sobre el mid, el spread y el volumen REALES, con el impacto
+     propio superpuesto por el modelo, como COMPRA y como VENTA: el promedio cancela la trayectoria
+     y queda el costo; un solo lado conserva el timing real, que es el riesgo. La atribución suma
+     exacta: spread + impacto propio + transitorio + permanente + timing. Además:
+       · el VWAP contrafactual: el benchmark del mercado CON nuestra orden dentro;
+       · comparación pareada contra TWAP entre sesiones con t, Wilcoxon, Holm y la diferencia mínima
+         detectable; "más barato" sólo si es significativo Y de al menos 0.02 t/c (o el 0.5 % del
+         costo de TWAP);
+       · la frontera eficiente del modelo, la incertidumbre de los parámetros (θ ~ N(θ̂, V robusta)),
+         el arrepentimiento si la verdad es otra (τ a la mitad o al doble, π en 0 o 1, A ±50 %) y el
+         impacto pico de la orden contra la ley de raíz cuadrada (Tóth et al. 2011). El arrepentimiento
+         se mide en E + λ·Var, el mismo objetivo que minimiza el ÓPTIMO;
+       · el PLAN de la próxima sesión: contratos por slice con hora de Chicago y de CDMX.
+
+  Además: una réplica fiel de tu script sobre la misma sesión, un simulador cuyo impacto sigue
+  EXACTAMENTE el modelo (y escribe DBN de verdad), el chequeo de cordura ✓/⚠, 31 pruebas internas,
+  Telegram (resumen + plan + tableros) y 8 CSV: eventos clave, MLE, curva, rolling, walk-forward,
+  comparación, sesión objetivo y plan.
+
+QUÉ SE MIDIÓ
+QUÉ SE MIDIÓ — 12 simulaciones de 12 sesiones (~420 000 operaciones y ~10 000 eventos clave cada una)
+con el impacto CONOCIDO (δ = 0.5, π = 0.4, τ = 90 s): 6 base, 3 con memoria en el signo del flujo (la
+mitad de las órdenes copia el lado de la anterior, como en los mercados reales) y 3 SIN impacto. La
+orden se escaló a 710 contratos: el 1.5 % del volumen del horizonte, lo que 5 000 son del NQ real.
+
+    el modelo (6 base)                              respuesta         propagador
+    δ̂ (verdad 0.50)                                0.485 ± 0.021     0.485 ± 0.026
+    el IC 95 % de δ cubre la verdad                 4 de 6            5 de 6
+    impacto inicial estimado / verdadero            1.01              1.01
+    con memoria en el signo: δ̂                     0.464             0.495
+    el IC de τ cubre los 90 s                       6 de 6            4 de 6
+
+  · El EE robusto de δ sale ~25 % corto con 11 sesiones (el jackknife da casi lo mismo que el sándwich).
+    Con más sesiones mejora; trata el IC como mínimo.
+  · Con memoria en el signo, la RESPUESTA a un print grande le atribuye el flujo que vino después (δ
+    sesgado a 0.46). El PROPAGADOR, que superpone el impacto de todas las huellas, lo corrige (0.495): por
+    eso es el modelo con el que se ejecuta. Gana en CLAIC en 5 de 6 corridas base y en las 3 con memoria.
+  · π y τ se identifican mal: π̂ de −0.5 (la cota) a 0.75, τ̂ de 37 a 296 s. El decaimiento de 15-60 s
+    sale significativo en 3 de 6. Sin impacto, la t de A da 2.4, 1.4 y −0.8 (t de 10 gl).
+
+    la ejecución (6 base)          contra TWAP en el walk-forward     costo con el modelo VERDADERO*
+    VWAP                           +0.005 t/c, irrelevante (5 de 6)   +0.004 t/c
+    POV al 10 %                    +0.82 t/c, más caro (5 de 6)       +0.58 t/c
+    POV*                           +0.04 t/c                          +0.03 t/c
+    Almgren–Chriss                 +0.0005 t/c, indistinguible        +0.0006 t/c
+    ÓPTIMO                         −0.0004 t/c, indistinguible        +0.0010 t/c
+    * arrepentimiento en E + λ·Var sobre el óptimo verdadero, en la sesión objetivo.
+
+  · Lo que separa a los algoritmos es el RIESGO, no el costo. La desviación del IS de un solo lado es de
+    ~70 t/c en 6.5 horas: decenas de miles de veces las diferencias de costo entre TWAP, VWAP, AC y
+    ÓPTIMO. POV cuesta 0.8 t/c más pero termina en 30-50 minutos y su riesgo baja a 25 t/c.
+  · El nivel del costo depende de π, que se estima mal: el modelo daba 3.6 t/c cuando la verdad era
+    4.8, sobre todo impacto permanente. El orden entre algoritmos sí se sostiene.
+  · Tu script, sobre la misma sesión, habría elegido TWAP 4 veces y VWAP 2 de 6: lo decide el día.
+  · La revisión encontró un caso grave que ya está corregido. Con memoria en el signo, un π̂ = 1.5 hacía
+    que el ÓPTIMO metiera los 710 contratos en un solo slice: costaba 2.71 t/c de más contra la verdad.
+    Con π ≤ 0.9 y el tope de participación, el exceso bajó a 0.14 t/c (el peor de las 12 corridas).
+
+QUÉ FALLABA EN EL SCRIPT QUE MANDASTE (los comentarios [v1] lo marcan en el código)
+
+  · LA API KEY ESTÁ ESCRITA EN LA LÍNEA 15. Dala por publicada y regenérala. Aquí se lee de
+    DATABENTO_API_KEY, igual que en tus otros módulos.
+
+  · LOS PRECIOS SALEN EN 0.00002. to_df() ya entrega los precios en decimales y tu fetch_data los
+    divide otra vez entre 1e9. Los bps sobreviven porque son relativos; cualquier precio impreso no.
+
+  · NO HAY MODELO DE IMPACTO. El slippage es una fórmula inventada (5 bps × q/V, o 10 bps × (q/V −
+    0.2) arriba del 20 %), discontinua en la pendiente, que no cobra el spread ni deja impacto para
+    las órdenes siguientes. Con eso, partir la orden en 78 pedazos o en 3 cuesta casi lo mismo.
+
+  · VWAP MIRA AL FUTURO. Sus pesos son el volumen del MISMO día que ejecuta: a las 8:30 ya sabe
+    cuánto se va a operar a las 14:00. Un VWAP real sólo tiene el perfil de los días anteriores.
+
+  · POV TAMBIÉN, Y NO ES LA MISMA ORDEN. Decide cada bloque con el volumen de esos 5 minutos, que
+    todavía no ocurren, y al 10 % termina los 5,000 contratos en minutos, no en 6.5 horas. Comparar
+    su slippage con el de TWAP es comparar dos órdenes distintas.
+
+  · CADA ALGORITMO TIENE SU PROPIO BENCHMARK. El "VWAP de mercado" se calcula sólo con los minutos
+    en que operó ese algoritmo: el de POV es el VWAP de su primera hora.
+
+  · TODO SE EJECUTA AL CIERRE DE UN MINUTO, el slice entero a un precio.
+
+  · EL "MEJOR" ES EL DE MENOR |slippage| DE UN SOLO DÍA. Eso lo decide la trayectoria del precio,
+    no el algoritmo, y el valor absoluto premia un slippage NEGATIVO grande igual que uno positivo.
+
+  · Menores: menciona Almgren–Chriss sin implementarlo, importa scipy (interp1d) sin usarlo, usa
+    twinx para precio y volumen, sale con exit(), total_cost suma diferencias de precio sin
+    ponderarlas por contratos y la columna volume se "inventa" con (high − low)·1000 si no viene.
+
+LÍMITES QUE CONVIENE SABER
+  · π y τ se identifican MAL con pocas sesiones (el impacto que decae se confunde con la difusión):
+    en las simulaciones π̂ fue de −0.5 (la cota) a 0.75 y τ̂ de 37 a 296 s, con verdad 0.4 y 90 s.
+    Por eso el reporte da el arrepentimiento: con TWAP, AC y ÓPTIMO cambiar τ a la mitad o al
+    doble, o π a 0 o 1, mueve el costo centésimas de tick.
+  · El impacto PERMANENTE de tu propia orden es igual para cualquier plan que termine (½·κ_P·X²):
+    los algoritmos sólo reparten transitorio contra riesgo de timing. En una orden de 6.5 horas el
+    riesgo de timing es decenas de veces mayor que la diferencia de costo entre algoritmos.
+  · El histórico no contiene tu orden. El timing de la réplica es real; el costo del impacto propio
+    es del MODELO calibrado y se rotula así. TBBO no permite saber cuánta liquidez habría absorbido
+    tu orden en el 2.º o 3.er nivel.
+  · Los eventos clave son prints AGRESIVOS grandes. Una institución que ejecuta pasivamente con
+    órdenes límite no aparece como evento clave.
+  · Un día no es muestra. Con 5-10 sesiones de prueba, sólo diferencias de varias centésimas de tick
+    salen significativas (mira la columna MDE).
+  · La simulación decide la plomería y la estadística, no cuánto vale A en el NQ real.
+
+CÓMO SE USA
+    pip install numpy pandas matplotlib databento scipy      # scipy es opcional
+    python optimal_execution.py --pruebas                    # 31 pruebas, sin red (~2 min)
+    python optimal_execution.py --simulacion                 # mercado simulado con impacto CONOCIDO
+    python optimal_execution.py --simulacion --sin-impacto   # el mismo, sin impacto (falsos positivos)
+    python optimal_execution.py                              # NQ, sesión del 2026-08-20 + 10 previas
+    python optimal_execution.py --sesion 2026-09-25 --lado venta --orden 3000 --urgencia 2
+    python optimal_execution.py --simbolo ES --inicio 08:30 --fin 12:00 --slice-min 10
+    python optimal_execution.py --archivo tbbo.dbn.zst --archivo-ohlcv ohlcv.dbn.zst
+    python optimal_execution.py --rapido                     # sin jackknife, perfil de δ ni θ aleatorios
+    python optimal_execution.py --solo-plan --telegram       # el plan de mañana a tu teléfono
+    python optimal_execution.py --telegram                   # resumen + plan + 2 tableros
+  Con la simulación (16 sesiones) el análisis completo tarda ~7 min y --rapido ~3. Con datos reales del
+  NQ, que traen ~15 veces más operaciones por sesión, espera más (el propagador recorre todas las huellas).
+  --inicio y --fin van en hora de CHICAGO (tu 13:30-20:00 UTC = 08:30-15:00 CT en verano). Los
+  reportes y el plan van en hora de Chicago y de CDMX. Antes de descargar se revisa el costo de las
+  dos descargas juntas (--costo-max, 25 USD por omisión); la caché queda en datos_databento/.
+
+LAS CREDENCIALES NO VAN EN EL CÓDIGO — igual que en tus otros módulos.
+    Databento   DATABENTO_API_KEY     PowerShell:  setx DATABENTO_API_KEY "db-..."
+    Telegram    TELEGRAM_BOT_TOKEN                 setx TELEGRAM_BOT_TOKEN "123456789:AA..."
+                TELEGRAM_CHAT_ID                   setx TELEGRAM_CHAT_ID "123456789"
+    (cierra y abre VS Code después de setx). El token te lo da @BotFather; el chat_id lo
+    encuentras con --telegram-buscar-chat después de escribirle /start a tu bot. Si falta
+    alguna y la terminal es interactiva, se pide con getpass y no se guarda. Los errores de
+    Telegram nunca muestran el token.
+
+FUENTES
+  · Almgren, R. y Chriss, N. (2000). Optimal execution of portfolio transactions. J. of Risk 3(2).
+  · Obizhaeva, A. y Wang, J. (2013). Optimal trading strategy and supply/demand dynamics. J. of
+    Financial Markets 16(1).
+  · Alfonsi, A., Fruth, A. y Schied, A. (2010). Optimal execution strategies in limit order books
+    with general shape functions. Quantitative Finance 10(2).
+  · Alfonsi, A., Schied, A. y Slynko, A. (2012). Order book resilience, price manipulation, and the
+    positive portfolio problem. SIAM J. on Financial Mathematics 3(1).
+  · Gatheral, J. (2010). No-dynamic-arbitrage and market impact. Quantitative Finance 10(7).
+  · Huberman, G. y Stanzl, W. (2004). Price manipulation and quasi-arbitrage. Econometrica 72(4).
+  · Bouchaud, J.-P., Gefen, Y., Potters, M. y Wyart, M. (2004). Fluctuations and response in
+    financial markets: the subtle nature of 'random' price changes. Quantitative Finance 4(2).
+  · Tóth, B. et al. (2011). Anomalous price impact and the critical nature of liquidity in
+    financial markets. Physical Review X 1.
+  · Varin, C., Reid, N. y Firth, D. (2011). An overview of composite likelihood methods. Statistica
+    Sinica 21 (CLAIC).
+  · Cameron, A. C., Gelbach, J. y Miller, D. (2008). Bootstrap-based improvements for inference
+    with clustered errors. Review of Economics and Statistics 90(3) (CR1 y CV3 con pocos grupos).
+  · Nyblom, J. (1989). Testing for the constancy of parameters over time. JASA 84(405).
+  · Holm, S. (1979). A simple sequentially rejective multiple test procedure. Scand. J. of Statistics 6(2).
+  · Databento: esquemas TBBO y OHLCV, campos side (agresor), flags y precios en punto fijo.
 """
 from __future__ import annotations
 
@@ -1556,7 +1787,8 @@ class Verosimilitud:
         if A is None:
             A = self.A_gls(p, piezas)
             if self.esp.dist == "t":
-                A = self._A_t(p, piezas, A)
+                A = self._A_t(p, piezas, getattr(self, "_A_t_previo", A))
+                self._A_t_previo = A                       # arranque en caliente: evaluaciones seguidas están cerca
         out = np.empty(self.obs.n)
         for g, (Siu, Siy, logdet, u, y) in zip(self.grupos, piezas):
             # rᵀΣ⁻¹r con r = y − A·u = yᵀΣ⁻¹y − 2A·uᵀΣ⁻¹y + A²·uᵀΣ⁻¹u
@@ -3866,7 +4098,7 @@ def panel_ajuste(res: Resultado, ax_q, ax_h) -> None:
     obs = res.obs
     aj = res.ajustes["respuesta"]
     K = obs.K
-    _estilo(ax_q, "(b) Ajuste MLE · impacto inicial vs tamaño del print (modelo en los mismos eventos)")
+    _estilo(ax_q, "(b) Ajuste MLE · impacto inicial vs tamaño")
     x = K["x"].to_numpy()
     y = K["lado"].to_numpy() * obs.dm[:, 0] / K["sig5"].to_numpy()
     ok = np.isfinite(x) & np.isfinite(y) & (x > 0)
