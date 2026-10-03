@@ -196,7 +196,7 @@ CÓMO SE USA
     python optimal_execution.py --rapido                     # sin jackknife, perfil de δ ni θ aleatorios
     python optimal_execution.py --solo-plan --telegram       # el plan de mañana a tu teléfono
     python optimal_execution.py --telegram                   # resumen + plan + 2 tableros
-  Con la simulación (16 sesiones) el análisis completo tarda ~7 min y --rapido ~3. Con datos reales del
+  Con la simulación (16 sesiones) el análisis completo tarda ~9 min y --rapido ~4. Con datos reales del
   NQ, que traen ~15 veces más operaciones por sesión, espera más (el propagador recorre todas las huellas).
   --inicio y --fin van en hora de CHICAGO (tu 13:30-20:00 UTC = 08:30-15:00 CT en verano). Los
   reportes y el plan van en hora de Chicago y de CDMX. Antes de descargar se revisa el costo de las
