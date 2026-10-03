@@ -168,7 +168,9 @@ def _fmt(x, dec=3, ancho=9) -> str:
         v = float(x)
     except (TypeError, ValueError):
         return str(x).rjust(ancho)
-    return f"{v:{ancho}.{dec}f}" if np.isfinite(v) else "—".rjust(ancho)
+    if not np.isfinite(v):
+        return "—".rjust(ancho)
+    return f"{(0.0 if abs(v) < 0.5 * 10 ** -dec else v):{ancho}.{dec}f}"
 
 
 def _pct(x, dec=1, ancho=7) -> str:
@@ -347,6 +349,8 @@ def validar(cfg: Config) -> None:
         a, b = segundo_de_hora(cfg.inicio_ct), segundo_de_hora(cfg.fin_ct)
         if a >= b:
             sys.exit("❌ --inicio debe ser antes de --fin (hora de Chicago).")
+        if b > MINUTOS_SESION * 60:
+            sys.exit("❌ --fin debe ser a más tardar 16:00 CT (de 16:00 a 17:00 Globex está cerrado).")
         if ((b - a) // 60) % cfg.slice_min or (b - a) % 60:
             sys.exit("❌ El horizonte --inicio → --fin debe ser un múltiplo exacto de --slice-min minutos.")
         pd.Timestamp(cfg.sesion_objetivo)
@@ -696,6 +700,7 @@ class MotorEventos:
 
     def eventos(self) -> pd.DataFrame:
         partes = [p for p in self.partes if len(p["t"])]
+        self.partes = []                                   # no retener una copia de todos los eventos
         if not partes:
             return pd.DataFrame({c: np.zeros(0, np.int64) for c in COLS_EVENTO})
         return pd.DataFrame({c: np.concatenate([p[c] for p in partes]) for c in COLS_EVENTO})
@@ -893,7 +898,7 @@ def clasificar_magnitud(H: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, np.
                 izq = np.searchsorted(ref, v, side="left")
                 der = np.searchsorted(ref, v, side="right")
                 pct[m] = (izq + 0.5 * (der - izq)) / len(ref)
-                clase[m] = (v >= q[0]).astype(int) + (v >= q[1]) + (v >= q[2])
+                clase[m] = (v >= q[0]).astype(int) + (v >= max(q[0], q[1])) + (v >= max(q[0], q[1], q[2]))
             filas.append(fila)
     U = pd.DataFrame(filas).sort_values(["sesion", "franja"]).reset_index(drop=True)
     return U, pct, clase
@@ -1092,8 +1097,7 @@ class Perfiles:
     `sesiones_perfil` sesiones ANTERIORES (mediana del volumen; σ = raíz de la media recortada de
     la varianza realizada). Nunca usan la sesión que se ejecuta. El volumen sale del OHLCV-1m (más
     historia, barato); la σ, del MID del TBBO cuando hay: el cierre de 1 minuto trae el rebote
-    bid-ask, que infla la σ sobre todo en las franjas quietas y sesga el exponente δ del impacto
-    (en la simulación, 0.45 en vez de 0.50; con el mid, 0.48).
+    bid-ask (con spreads de 1 tick el efecto es chico: en la simulación δ̂ sale igual con las dos).
 
     [v1] Tu vwap_schedule reparte la orden con el volumen del MISMO día que ejecuta: sabe a las
     8:30 cuánto se va a operar a las 14:00. Eso es mirar al futuro; un VWAP real sólo tiene el
@@ -1117,16 +1121,16 @@ class Perfiles:
             self.fuente_sigma = "mid del TBBO"
         else:
             self.fuente_sigma = "cierre del OHLCV-1m"
-        # sesiones incompletas (festivos, cierres anticipados) no entran al perfil
-        tot = self.vol.sum(axis=1)
-        self.completas = tot.index[tot >= 0.5 * tot.median()] if len(tot) else tot.index
+        self.tot = self.vol.sum(axis=1)
         self._cache: dict[int, tuple] = {}
 
     def de(self, dia: int) -> tuple[np.ndarray, np.ndarray, int]:
         """(volumen por slot, σ por slot en ticks, sesiones usadas) para la sesión `dia`."""
         if dia in self._cache:
             return self._cache[dia]
-        previas = [s for s in self.completas if s < dia][-self.cfg.sesiones_perfil:]
+        # sesiones incompletas (festivos, cierres anticipados) no entran: el umbral, con el pasado
+        tot = self.tot[self.tot.index < dia]
+        previas = list(tot.index[tot >= 0.5 * tot.median()])[-self.cfg.sesiones_perfil:] if len(tot) else []
         if not previas:
             out = (np.full(self.n_slots, np.nan), np.full(self.n_slots, np.nan), 0)
         else:
@@ -1201,26 +1205,28 @@ class Observaciones:
         return len(self.K)
 
 
-def deriva_sesiones(barras: pd.DataFrame, cfg: Config) -> dict:
+def deriva_sesiones(E: pd.DataFrame, cfg: Config) -> dict:
     """
-    Deriva de cada sesión en la franja del MLE (ticks/s): (último mid − primer mid) / duración. Se
+    Deriva de cada sesión en la franja del MLE (ticks/s): Σ (último mid − primer mid) / Σ duración, por
+    TRAMO (misma sesión y mismo contrato), para que el salto de un roll no se reste como tendencia. Se
     resta de cada observación: en un día de tendencia las grandes van sobre todo del lado de la
     tendencia, y sin restarla la deriva se disfraza de impacto PERMANENTE en los horizontes largos.
     """
-    if not len(barras):
+    if not len(E):
         return {}
-    b = barras.dropna(subset=["mid"])
+    m = np.isfinite(E["mid0"].to_numpy(dtype=float))
     if cfg.mle_franja == "rth":
-        r0, r1 = segundo_de_hora(cfg.rth_ct[0]), segundo_de_hora(cfg.rth_ct[1])
-        b = b[(b["seg"] >= r0) & (b["seg"] < r1)]
-    out = {}
-    for s, g in b.groupby("sesion"):
-        if len(g) < 30:
-            continue
-        dur = (g["t"].iloc[-1] - g["t"].iloc[0]) / NS
-        if dur > 0:
-            out[int(s)] = float((g["mid"].iloc[-1] - g["mid"].iloc[0]) / dur)
-    return out
+        m &= E["rth"].to_numpy().astype(bool)
+    D = pd.DataFrame({"s": E["sesion"].to_numpy()[m], "i": E["inst"].to_numpy()[m], "t": E["t"].to_numpy()[m],
+                      "mid": E["mid0"].to_numpy(dtype=float)[m]})
+    if not len(D):
+        return {}
+    g = D.groupby(["s", "i"], sort=False).agg(t0=("t", "first"), t1=("t", "last"), m0=("mid", "first"), m1=("mid", "last"))
+    g["dur"] = (g["t1"] - g["t0"]) / NS
+    g["dm"] = g["m1"] - g["m0"]
+    tot = g.groupby(level=0)[["dur", "dm"]].sum()
+    tot = tot[tot["dur"] >= 1800.0]
+    return {int(s): float(r["dm"] / r["dur"]) for s, r in tot.iterrows()}
 
 
 def eventos_clave(H: pd.DataFrame, E: pd.DataFrame, perf: Perfiles, var: Varianza, deriva: dict,
@@ -1263,9 +1269,16 @@ def eventos_clave(H: pd.DataFrame, E: pd.DataFrame, perf: Perfiles, var: Varianz
     n, kh = len(G), len(hs)
     dm = np.full((n, kh), np.nan)
     tob = np.zeros((n, kh), np.int64)
+    previo = None
     for j, h in enumerate(hs):
         tq = t1 + int(h * NS)
         jj = np.searchsorted(t_e, t1, side="right") if h == 0 else np.searchsorted(t_e, tq, side="left")
+        if previo is not None:
+            # si no hubo operaciones entre dos horizontes, los dos caerían en la MISMA observación (dos
+            # columnas idénticas que el modelo trataría como ruidos independientes: ω → 0). Se toma la
+            # primera operación POSTERIOR a la del horizonte anterior; el modelo usa su tiempo real.
+            jj = np.maximum(jj, np.searchsorted(t_e, t_e[np.minimum(previo, len(t_e) - 1)], side="right"))
+        previo = jj
         jc = np.minimum(jj, len(t_e) - 1)
         ok = (jj < len(t_e)) & (jj <= ft[i1]) & np.isfinite(mid_e[jc])
         dm[:, j] = np.where(ok, mid_e[jc] - m0, np.nan)
@@ -1537,6 +1550,8 @@ class Verosimilitud:
         piezas, _ = self.piezas(p)
         if A is None:
             A = self.A_gls(p, piezas)
+            if self.esp.dist == "t":
+                A = self._A_t(p, piezas, A)
         out = np.empty(self.obs.n)
         for g, (Siu, Siy, logdet, u, y) in zip(self.grupos, piezas):
             # rᵀΣ⁻¹r con r = y − A·u = yᵀΣ⁻¹y − 2A·uᵀΣ⁻¹y + A²·uᵀΣ⁻¹u
@@ -1552,6 +1567,27 @@ class Verosimilitud:
                 ll = -0.5 * (k * math.log(2 * math.pi) + logdet + q)
             out[g["idx"]] = ll
         return out, A
+
+    def _A_t(self, p: dict, piezas: list, A: float, iters: int = 100) -> float:
+        """
+        A de máxima verosimilitud con errores t (ν y Σ dados): mínimos cuadrados reponderados con
+        wᵢ = (ν + k)/(ν − 2 + qᵢ), que bajan el peso de los eventos extremos. Empieza en el GLS.
+        """
+        nu = p["nu"]
+        partes = [(np.einsum("ij,ij->i", y, Siy), np.einsum("ij,ij->i", u, Siy), np.einsum("ij,ij->i", u, Siu), g["k"])
+                  for g, (Siu, Siy, _, u, y) in zip(self.grupos, piezas)]
+        for _ in range(iters):
+            num = den = 0.0
+            for yy, uy, uu, k in partes:
+                q = np.maximum(yy - 2 * A * uy + A * A * uu, 0.0)
+                w = (nu + k) / (nu - 2 + q)
+                num += float(w @ uy)
+                den += float(w @ uu)
+            nuevo = num / den if den > 0 else A
+            if abs(nuevo - A) <= 1e-10 * (1 + abs(A)):
+                return nuevo
+            A = nuevo
+        return A
 
     def mahalanobis(self, p: dict, A: float) -> tuple[np.ndarray, np.ndarray]:
         piezas, _ = self.piezas(p)
@@ -1586,6 +1622,7 @@ class Ajuste:
     evaluaciones: int = 0
     V: np.ndarray | None = None                     # covarianza robusta en la escala del optimizador
     nombres_v: list = field(default_factory=list)
+    en_cota: list = field(default_factory=list)     # parámetros que quedaron en una cota: sin EE (fijos)
 
     @property
     def k_par(self) -> int:
@@ -1750,6 +1787,7 @@ def ajustar(obs: Observaciones, esp: Especificacion, x_ref: float, flujo: Flujo 
     for nm in libres:
         b_lo, b_hi = _cotas_opt(nm)
         if min(abs(x[libres.index(nm)] - b_lo), abs(b_hi - x[libres.index(nm)])) < 1e-3 * (b_hi - b_lo):
+            aj.en_cota.append(nm)
             if nm == "phi" and abs(x[libres.index(nm)] - b_lo) < 1e-3 * (b_hi - b_lo):
                 continue                                           # ϕ = 0: sin varianza extra en el horizonte 0
             aj.avisos.append(f"{nm} quedó en la cota ({p[nm]:.3g}): no identificado con estos datos")
@@ -1759,10 +1797,13 @@ def ajustar(obs: Observaciones, esp: Especificacion, x_ref: float, flujo: Flujo 
 
 
 def errores_estandar(aj: Ajuste, vero: Verosimilitud, base: dict, jackknife: bool) -> None:
-    libres = aj.libres
+    # los que quedaron en una cota no tienen score cero ni curvatura válida: se tratan como FIJOS (si no,
+    # el hessiano deja de ser definido positivo, el castigo del CLAIC sale negativo y los IC explotan)
+    libres = [nm for nm in aj.libres if nm not in aj.en_cota]
     nombres = ["A"] + libres
     x0 = np.r_[aj.A, [_a_opt(nm, aj.p[nm]) for nm in libres]]
     kp = len(x0)
+    base = dict(base, **aj.p)
 
     def ll_vec(x):
         p = dict(base)
@@ -1790,10 +1831,13 @@ def errores_estandar(aj: Ajuste, vero: Verosimilitud, base: dict, jackknife: boo
                 v = (ll_vec(x0 + ei + ej).sum() - ll_vec(x0 + ei - ej).sum() - ll_vec(x0 - ei + ej).sum()
                      + ll_vec(x0 - ei - ej).sum()) / (4 * hstep[i] * hstep[j])
             Hm[i, j] = Hm[j, i] = -v
+    def_pos = bool(np.all(np.linalg.eigvalsh((Hm + Hm.T) / 2) > 0))
     try:
-        Hi = np.linalg.inv(Hm)
+        Hi = np.linalg.inv(Hm) if def_pos else np.linalg.pinv(Hm)
     except np.linalg.LinAlgError:
         Hi = np.linalg.pinv(Hm)
+    if not def_pos:
+        aj.avisos.append("el hessiano no es definido positivo: EE poco confiables y sin CLAIC")
     ses = vero.obs.K["sesion"].to_numpy()
     usesiones, inv = np.unique(ses, return_inverse=True)
     G = len(usesiones)
@@ -1801,7 +1845,7 @@ def errores_estandar(aj: Ajuste, vero: Verosimilitud, base: dict, jackknife: boo
     np.add.at(Sg, inv, S)
     J = Sg.T @ Sg
     V_cr1 = Hi @ J @ Hi * (G / (G - 1) if G > 1 else 1.0)
-    aj.claic = -2 * aj.ll + 2 * float(np.trace(J @ Hi))
+    aj.claic = -2 * aj.ll + 2 * float(np.trace(J @ Hi)) if def_pos else np.nan
     V = V_cr1.copy()
     if jackknife and G >= 3:
         thetas = []
@@ -1815,8 +1859,13 @@ def errores_estandar(aj: Ajuste, vero: Verosimilitud, base: dict, jackknife: boo
         V_cv3 = (G - 1) / G * (T.T @ T)
         for j, nm in enumerate(nombres):
             aj.se_cv3[nm] = math.sqrt(max(V_cv3[j, j], 0.0))
-        V = np.where(np.diag(V_cv3)[:, None] * np.diag(V_cv3)[None, :] >
-                     np.diag(V_cr1)[:, None] * np.diag(V_cr1)[None, :], V_cv3, V_cr1)
+        # varianzas: la mayor de las dos; correlaciones: las de CR1 (así V queda semidefinida positiva)
+        d1 = np.sqrt(np.maximum(np.diag(V_cr1), 0.0))
+        d = np.sqrt(np.maximum(np.maximum(np.diag(V_cr1), np.diag(V_cv3)), 0.0))
+        R = V_cr1 / np.where(np.outer(d1, d1) > 0, np.outer(d1, d1), 1.0)
+        V = R * np.outer(d, d)
+    w, Q = np.linalg.eigh((V + V.T) / 2)
+    V = (Q * np.maximum(w, 0.0)) @ Q.T
     aj.V, aj.nombres_v = V, nombres
     tq = t_cuantil(0.975, G - 1) if G > 1 else np.nan
     for j, nm in enumerate(nombres):
@@ -1829,6 +1878,9 @@ def errores_estandar(aj: Ajuste, vero: Verosimilitud, base: dict, jackknife: boo
             aj.se_cv3[nm] = der * aj.se_cv3[nm]
         aj.se[nm] = der * se_rob
         lo_, hi_ = x0[j] - tq * se_rob, x0[j] + tq * se_rob
+        if nm != "A":                                              # acotado al dominio (y sin desbordar exp)
+            b_lo, b_hi = _cotas_opt(nm)
+            lo_, hi_ = min(max(lo_, b_lo), b_hi), min(max(hi_, b_lo), b_hi)
         aj.ic[nm] = (lo_, hi_) if nm == "A" else (_de_opt(nm, lo_), _de_opt(nm, hi_))
     if "pi" in libres and aj.se_hess.get("pi", 0) > 0.25:
         aj.avisos.append(f"π no identificado: EE ≥ {aj.se_hess['pi']:.2f} aun suponiendo eventos independientes")
@@ -1907,13 +1959,18 @@ def prueba_permanente(curva: pd.DataFrame, sesiones: int, desde: float = 15, has
     return gbar, t, p_t(t, max(sesiones - 1, 1))
 
 
-def perfil_delta(obs: Observaciones, aj: Ajuste, vero: Verosimilitud,
-                 rejilla: np.ndarray = np.round(np.arange(0.1, 1.41, 0.1), 2)) -> pd.DataFrame:
+def perfil_delta(obs: Observaciones, aj: Ajuste, vero: Verosimilitud, rejilla: np.ndarray | None = None) -> pd.DataFrame:
     """
     Perfil de verosimilitud de δ: para cada δ fijo se re-optimiza lo demás. Como la verosimilitud es
     COMPUESTA (los eventos no son independientes), el LR se escala por ĉ = V_robusta/V_hessiano de δ y
     se compara con ĉ·t²(G−1, 0.975) para el IC.
     """
+    if rejilla is None:
+        se = aj.se.get("delta", np.nan)
+        se = se if np.isfinite(se) and se > 0 else 0.05
+        lo, hi = COTAS["delta"]
+        fina = np.clip(aj.p["delta"] + se * np.linspace(-4, 4, 13), lo, hi)
+        rejilla = np.unique(np.round(np.r_[fina, 0.5, 1.0], 4))
     filas = []
     inicio = dict(aj.p)
     for d in rejilla:
@@ -1925,9 +1982,22 @@ def perfil_delta(obs: Observaciones, aj: Ajuste, vero: Verosimilitud,
     T = pd.DataFrame(filas)
     c = (aj.se.get("delta", np.nan) / aj.se_hess.get("delta", np.nan)) ** 2 if aj.se_hess.get("delta") else 1.0
     c = max(c, 1.0) if np.isfinite(c) else 1.0
-    T["lr"] = 2 * (aj.ll - T["ll"]) / c
-    T.attrs["umbral"] = t_cuantil(0.975, max(aj.sesiones - 1, 1)) ** 2
+    T["lr"] = np.maximum(2 * (aj.ll - T["ll"]) / c, 0.0)
+    T.attrs["umbral"] = u = t_cuantil(0.975, max(aj.sesiones - 1, 1)) ** 2
     T.attrs["c"] = c
+    # IC: donde el LR cruza el umbral, interpolando a cada lado de δ̂
+    d, lr = T["delta"].to_numpy(), T["lr"].to_numpy()
+    ic = [np.nan, np.nan]
+    for lado, sel in ((0, d <= aj.p["delta"]), (1, d >= aj.p["delta"])):
+        dd, ll_ = d[sel], lr[sel]
+        if lado == 0:
+            dd, ll_ = dd[::-1], ll_[::-1]
+        dd, ll_ = np.r_[aj.p["delta"], dd], np.r_[0.0, ll_]
+        cruza = np.flatnonzero((ll_[:-1] <= u) & (ll_[1:] > u))
+        if len(cruza):
+            k = cruza[0]
+            ic[lado] = float(dd[k] + (u - ll_[k]) * (dd[k + 1] - dd[k]) / (ll_[k + 1] - ll_[k]))
+    T.attrs["ic"] = tuple(ic)
     return T
 
 
@@ -2088,7 +2158,7 @@ def perfil_spread(barras: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     b = barras.dropna(subset=["spread"])
     slot = (b["seg"].to_numpy() // (cfg.slot_min * 60)).astype(np.int64)
     return pd.DataFrame({"sesion": b["sesion"].to_numpy(), "slot": slot, "spread": b["spread"].to_numpy()}).groupby(
-        ["sesion", "slot"])["spread"].mean().unstack()
+        ["sesion", "slot"])["spread"].mean().unstack().reindex(columns=range(MINUTOS_SESION // cfg.slot_min))
 
 
 def mercado(dia: int, perf: Perfiles, spreads: pd.DataFrame, cfg: Config, clip_s: float = 20.0) -> Mercado:
@@ -2200,6 +2270,7 @@ def qp_simplex(Qn: np.ndarray, bn: np.ndarray, X: float, iters: int = 500) -> tu
     Devuelve (n, convergió).
     """
     N = len(bn)
+    Qn = Qn + 1e-9 * max(float(np.mean(np.abs(np.diag(Qn)))), 1e-300) * np.eye(N)   # Q singular (π = 1): KKT compatible
     libre = np.ones(N, bool)
     n = np.full(N, X / N)
     for _ in range(iters):
@@ -2251,11 +2322,11 @@ def optimo_ow(X: float, lam: float, M: dict, mer: Mercado) -> tuple[np.ndarray, 
 
 
 def eta_slices(mod: ModeloImpacto, mer: Mercado, M: dict) -> np.ndarray:
-    """η de cada slice (ticks por contrato², costo = η·n²): el bloque del propio slice con flujo parejo."""
+    """η de cada slice (ticks por contrato², costo = η·n²): el bloque TRANSITORIO del propio slice con flujo parejo."""
     eta = np.zeros(mer.N)
     for k in range(mer.N):
         a, b = k * mer.m, (k + 1) * mer.m
-        blk = np.diag(mod.c_self * (mod.kP + mod.kT[a:b])) + M["KT"][a:b, a:b]
+        blk = np.diag(mod.c_self * mod.kT[a:b]) + M["KT"][a:b, a:b]       # sin el permanente: no distingue planes
         eta[k] = float(blk.sum()) / mer.m ** 2
     return eta
 
@@ -2274,6 +2345,10 @@ def almgren_chriss(X: float, lam: float, eta: np.ndarray, sig2: np.ndarray) -> n
         return np.array([float(X)])
     e = np.asarray(eta, float)
     s2 = np.asarray(sig2, float) * lam / 3.0
+    escala = max(float(np.max(e)), float(np.max(s2)), 0.0)
+    if escala <= 0:                                        # sin transitorio ni aversión (π = 1, λ = 0): da igual, parejo
+        return np.full(N, X / N)
+    e = np.maximum(e, 1e-9 * escala)                       # π = 1: sin η el sistema es singular
     T = np.zeros((N - 1, N - 1))
     rhs = np.zeros(N - 1)
     for j in range(1, N):                                  # ecuación de x_j (fila j−1)
@@ -2325,13 +2400,19 @@ def realizado(mer: Mercado, E: pd.DataFrame, barras: pd.DataFrame) -> Realizado 
     """Mid (libro previo a la primera operación a partir de cada clip), spread y volumen por minuto."""
     t_e = E["t"].to_numpy()
     mid_e = E["mid0"].to_numpy()
-    j = np.searchsorted(t_e, mer.t_clip, side="left")
-    if j.max() >= len(t_e) or len(t_e) == 0:
+    if len(t_e) == 0:
         return None
+    j = np.searchsorted(t_e, mer.t_clip, side="left")
+    if j.max() >= len(t_e):
+        return None
+    ses_e = E["sesion"].to_numpy()
+    jf0 = min(int(np.searchsorted(t_e, mer.t1, side="left")), len(t_e) - 1)
+    if (ses_e[j] != mer.dia).any() or ses_e[jf0] != mer.dia:
+        return None                                        # cierre anticipado o hueco: el mid sería de otra sesión
     mid = pd.Series(mid_e[np.minimum(j, len(t_e) - 1)]).ffill().bfill().to_numpy()
     m_ini, m_fin = mer.t0 // NS_MIN, mer.t1 // NS_MIN
     b = barras.reindex(np.arange(m_ini, m_fin))
-    if b["vol"].isna().mean() > 0.5:
+    if b["vol"].isna().mean() > 0.5:                     # minutos sin operaciones son normales en contratos poco líquidos
         return None
     vol_min = b["vol"].fillna(0.0).to_numpy()
     vwap_min = b["vwap"].to_numpy(dtype=float)
@@ -2385,9 +2466,11 @@ def plan_pov(X: float, rho: float, mer: Mercado, vol_min: np.ndarray) -> tuple[n
         else:
             ajuste = mer.w_min[t] / mer.w_min[t - 1] if mer.w_min[t - 1] > 0 else 1.0
             obj = r * vol_min[t - 1] * ajuste
-        obj = min(obj, X - hecho)
-        if obj <= 0:
+        if X - hecho <= 1e-9:
             break
+        obj = min(obj, X - hecho)
+        if obj <= 0:                                       # un minuto sin volumen: no opera, sigue
+            continue
         a = t * clips_min
         u[a:a + clips_min] = obj / clips_min
         hecho += obj
@@ -2413,9 +2496,9 @@ def ejecutar(u: np.ndarray, lado: int, mer: Mercado, mod: ModeloImpacto, M: dict
     s = float(lado)
     m0 = float(real.mid[0])
     U = np.cumsum(u) - u                                    # lo ejecutado ANTES de cada clip
-    perm = mod.kP * U
+    perm = mod.kP * (U + mod.c_self * u)                    # Σ u·perm = ½κ_P·X²: igual para cualquier plan
     trans = M["KT"] @ u
-    propio = mod.c_self * M["kk"] * u
+    propio = mod.c_self * mod.kT * u                        # sólo el transitorio del propio clip
     spread = real.spread / 2.0
     precio = real.mid + s * (spread + propio + perm + trans)
     partes = {"spread": float(u @ spread), "propio": float(u @ propio), "transitorio": float(u @ trans),
@@ -2527,6 +2610,9 @@ def backtest(sesiones: list, ajustes: dict, x_ref: float, perf: Perfiles, spread
     pico = pico_impacto(X, mer_obj, mod_obj, M_obj, planes_obj["ÓPTIMO"])
     if not (1 / 3 <= pico["razon"] <= 3):
         avisos.append(f"el impacto pico de la orden en el modelo es {pico['razon']:.2f}× el de la ley de raíz cuadrada")
+    if mer_obj is not None and mer_obj.dia != dia_objetivo(cfg):
+        avisos.append(f"la sesión objetivo {cfg.sesion_objetivo} no se pudo replicar (datos incompletos o fuera del "
+                      f"archivo): se muestra la {fecha_de_dia(mer_obj.dia):%Y-%m-%d}")
     if mod_obj is not None and not (0.0 <= mod_obj.pi_original <= 1.0):
         avisos.append(f"π̂ = {mod_obj.pi_original:.2f} fuera de [0, 1]: para ejecutar se recortó a {mod_obj.pi:.2f}")
     return Backtest(F, planes_obj, mer_obj, mod_obj, lam, fr, par, arr, comp, pico, avisos, real_obj, det_obj, forz_obj)
@@ -2567,8 +2653,8 @@ def parametrica(X: float, mer: Mercado, cfg: Config, lam: float, total: Ajuste, 
     La diferencia contra TWAP, pareada, con su intervalo 2.5–97.5 %.
     """
     rng = np.random.default_rng(17)
-    x0 = np.r_[total.A, [_a_opt(nm, total.p[nm]) for nm in total.libres]]
-    nombres = ["A"] + total.libres
+    nombres = list(total.nombres_v)
+    x0 = np.r_[total.A, [_a_opt(nm, total.p[nm]) for nm in nombres[1:]]]
     try:
         Lc = np.linalg.cholesky(total.V + 1e-12 * np.eye(len(x0)))
     except np.linalg.LinAlgError:
@@ -2589,9 +2675,9 @@ def parametrica(X: float, mer: Mercado, cfg: Config, lam: float, total: Ajuste, 
 
 def arrepentimiento(X: float, mer: Mercado, mod: ModeloImpacto, lam: float, planes: dict, cfg: Config) -> pd.DataFrame:
     """
-    Robustez al modelo: los planes se calcularon con el modelo estimado; ¿cuánto cuestan si la verdad es
-    otra (τ a la mitad o al doble, π en 0 o en 1, A ±50 %)? Arrepentimiento = costo − costo del óptimo
-    de ESE modelo, por contrato.
+    Robustez al modelo: los planes se calcularon con el modelo estimado; ¿cuánto pierden si la verdad es
+    otra (τ a la mitad o al doble, π en 0 o en 1, A ±50 %)? Arrepentimiento = (E + λ·Var) del plan − la
+    del ÓPTIMO de ESE modelo, por contrato: el mismo objetivo que minimiza el ÓPTIMO.
     """
     alternativas = {"estimado": {}, "τ × 0.5": {"tau": mod.tau * 0.5}, "τ × 2": {"tau": mod.tau * 2},
                     "π = 0 (todo transitorio)": {"pi": 0.0}, "π = 1 (todo permanente)": {"pi": 1.0},
@@ -2601,10 +2687,11 @@ def arrepentimiento(X: float, mer: Mercado, mod: ModeloImpacto, lam: float, plan
         p = {"delta": mod.delta, "pi": cambios.get("pi", mod.pi), "tau": cambios.get("tau", mod.tau)}
         m2 = modelo_impacto(p, cambios.get("A", mod.A), mod.x_ref, mer, cfg)
         M2 = matrices(m2, mer)
-        opt = costo_modelo(optimo_ow(X, lam, M2, mer)[0], X, M2)[0]
+        e_o, sd_o = costo_modelo(optimo_ow(X, lam, M2, mer)[0], X, M2)
+        opt = e_o + lam * sd_o ** 2
         for nm, u in planes.items():
-            c = costo_modelo(u, X, M2)[0]
-            filas.append({"modelo": nm_alt, "algoritmo": nm, "costo": c / X, "arrepentimiento": (c - opt) / X})
+            e, sd = costo_modelo(u, X, M2)
+            filas.append({"modelo": nm_alt, "algoritmo": nm, "costo": e / X, "arrepentimiento": (e + lam * sd ** 2 - opt) / X})
     return pd.DataFrame(filas)
 
 
@@ -2636,8 +2723,9 @@ def wilcoxon_p(d: np.ndarray) -> float:
 def comparar(F: pd.DataFrame, X: float) -> pd.DataFrame:
     """
     Pareada contra TWAP entre sesiones. COSTO = promedio de compra y venta (sin la trayectoria: costo
-    modelado); RIESGO = desviación del IS de un solo lado (timing real). t con n − 1 gl, Wilcoxon y Holm,
-    y el efecto mínimo detectable (80 % de potencia): si la diferencia no lo supera, es "indistinguible".
+    modelado); RIESGO = desviación del IS de un solo lado (timing real). t con n − 1 gl, Wilcoxon y Holm.
+    El veredicto usa p de Holm < 0.05 y un umbral de relevancia; el MDE (80 % de potencia) es informativo:
+    la diferencia que se habría podido detectar con esas sesiones.
     """
     c = F.groupby(["sesion", "algoritmo"])["is_por_contrato"].mean().unstack()
     compra = F[F["lado"] == 1].pivot(index="sesion", columns="algoritmo", values="is_por_contrato")
@@ -2671,7 +2759,7 @@ def comparar(F: pd.DataFrame, X: float) -> pd.DataFrame:
         if not (np.isfinite(ph) and ph < 0.05):
             return "indistinguible"
         txt = "más barato" if dd < 0 else "más caro"
-        return txt if abs(dd) >= umbral else f"{txt} (irrelevante: < {umbral:.2f} t/c)"
+        return txt if abs(dd) >= umbral else f"{txt}, irrelevante"
     T["veredicto"] = [veredicto(a, ph, dd) for a, ph, dd in zip(T["algoritmo"], T["p_holm"], T["dif_vs_twap"])]
     return T
 
@@ -2969,6 +3057,18 @@ def analizar(tbbo, ohlcv, cfg: Config, verdad: dict | None = None, verbose: bool
     if not len(E0):
         sys.exit("❌ No hubo agresiones válidas en el TBBO.")
     E = preparar_eventos(E0, cfg)
+    del E0
+    d_obj = dia_objetivo(cfg)
+    # nada posterior a la sesión objetivo (con --archivo puede haber más): se cortan las sesiones del final
+    E = E.iloc[:int(np.searchsorted(E["sesion"].to_numpy(), d_obj, side="right"))].copy()
+    barras = barras[barras["sesion"] <= d_obj] if len(barras) else barras
+    if not len(E):
+        sys.exit(f"❌ No hay eventos hasta la sesión {cfg.sesion_objetivo}.")
+    n_ses = int(E["sesion"].nunique())
+    cambios = int(np.sum(np.diff(E["inst"].to_numpy()) != 0))
+    if cambios > 2 * n_ses + 2:
+        sys.exit(f"❌ El TBBO trae varios contratos a la vez ({cambios:,} cambios de contrato en {n_ses} sesiones).\n"
+                 "   Usa simbología continua (NQ.n.0, como la descarga por omisión) o filtra un solo contrato.")
     H, hid = agrupar_huellas(E, cfg)
     E["hid"] = hid
     U, pct, clase = clasificar_magnitud(H, cfg)
@@ -2976,10 +3076,12 @@ def analizar(tbbo, ohlcv, cfg: Config, verdad: dict | None = None, verbose: bool
     H["tipo"] = tipificar(H, cfg)
     H["ventana"] = True
     b_ohlc = barras_ohlcv(ohlcv, cfg) if ohlcv is not None else pd.DataFrame()
+    if len(b_ohlc):
+        b_ohlc = b_ohlc[b_ohlc["sesion"] <= d_obj]
     slots_vol = tabla_slots(b_ohlc, cfg, "close") if len(b_ohlc) else tabla_slots(barras.assign(inst=0), cfg, "mid")
     perf = Perfiles(slots_vol, cfg, tabla_slots(barras.assign(inst=0), cfg, "mid"))
     var = Varianza(perf, cfg)
-    der = deriva_sesiones(barras, cfg)
+    der = deriva_sesiones(E, cfg)
     paso("Eventos clave")
     obs = eventos_clave(H, E, perf, var, der, cfg)
     if obs.n < cfg.min_eventos:
@@ -3028,7 +3130,9 @@ def analizar(tbbo, ohlcv, cfg: Config, verdad: dict | None = None, verbose: bool
 def cordura(res: Resultado) -> list:
     c = []
     m, i, cfg = res.motor, res.info, res.cfg
-    c.append((m.operaciones > 0.5 * m.registros, f"{m.operaciones:,} de {m.registros:,} registros son agresiones válidas"))
+    ops = m.registros - m.conteo.get(REGLAS[0], 0)
+    c.append((m.operaciones > 0.5 * ops, f"{m.operaciones:,} de {ops:,} operaciones son agresiones válidas"))
+    c.append((i["rolls"] <= i["sesiones_tbbo"], f"{i['rolls']} cambios de contrato en {i['sesiones_tbbo']} sesiones (un contrato a la vez)"))
     c.append((i["lado_ok"] > 0.95, f"side = agresor: {i['lado_ok']:.1%} de las compras en el ask previo o arriba"))
     c.append((i["sesiones_tbbo"] >= cfg.ventana_sesiones + 2,
               f"{i['sesiones_tbbo']} sesiones de TBBO y {i['sesiones_ohlcv']} de OHLCV · σ del perfil con {i['fuente_sigma']}"))
@@ -3049,18 +3153,20 @@ def cordura(res: Resultado) -> list:
         c.append((True, f"decaimiento: g promedio 15-60 s = {gb:.2f} (H0 sin decaimiento, p = {pg:.3f})"))
     cp = res.costo_propio
     if np.isfinite(cp.get("c", np.nan)):
-        c.append((True, f"costo propio del agresor = {cp['c']:.2f} ± {cp['se']:.2f} × su impacto (el optimizador usa ½)"))
+        c.append((abs(cp["c"] - 0.5) < max(2 * cp["se"], 0.25),
+                  f"costo propio del agresor = {cp['c']:.2f} ± {cp['se']:.2f} × su impacto (el optimizador usa ½)"))
     est = res.roll.estabilidad
     if np.isfinite(est.get("p", np.nan)):
         c.append((est["p"] > 0.05, f"estabilidad de A entre sesiones (Nyblom): p = {est['p']:.3f}"))
     bt = res.bt
     if len(bt.filas):
         n = bt.filas["sesion"].nunique()
-        z = bt.filas.loc[bt.filas["lado"] == 1, "z_timing"].to_numpy(dtype=float)
-        z = z[np.isfinite(z)]
+        z = bt.filas.loc[(bt.filas["lado"] == 1) & (bt.filas["algoritmo"] == "TWAP"), "z_timing"].to_numpy(dtype=float)
+        z = z[np.isfinite(z)]                                  # una por sesión: los algoritmos comparten la trayectoria
         c.append((n >= 5, f"{n} sesiones de prueba en el walk-forward"))
-        if len(z) > 5:
-            c.append((0.5 < np.std(z) < 2.0, f"timing estandarizado: media {np.mean(z):+.2f}, desv. {np.std(z):.2f} (≈ N(0, 1))"))
+        if len(z) >= 5:
+            c.append((0.5 < np.std(z, ddof=1) < 2.0,
+                      f"timing estandarizado (TWAP): media {np.mean(z):+.2f}, desv. {np.std(z, ddof=1):.2f} (≈ N(0, 1))"))
         fr = bt.frontera
         if len(fr):
             # optimalidad exacta: para cada λ de la frontera, ningún plan de la misma familia (slices con
@@ -3104,8 +3210,9 @@ def tu_script(b: pd.DataFrame, cfg: Config) -> dict:
     if not len(b):
         return {"disponible": False}
     d = dia_objetivo(cfg)
-    s0, s1 = segundo_de_hora(cfg.inicio_ct), segundo_de_hora(cfg.fin_ct)
-    df = b[(b["sesion"] == d) & (b["seg"] >= s0) & (b["seg"] < s1)].dropna(subset=["close"])
+    f = fecha_de_dia(d)
+    t0, t1 = a_utc(f"{f:%Y-%m-%d} 13:30", "UTC").value, a_utc(f"{f:%Y-%m-%d} 20:00", "UTC").value   # tu START/END_DATE
+    df = b[(b["t"] >= t0) & (b["t"] < t1)].dropna(subset=["close"])
     if len(df) < 30:
         return {"disponible": False}
     X, n_sl, pov = float(cfg.orden), 78, cfg.pov
@@ -3144,7 +3251,7 @@ def tu_script(b: pd.DataFrame, cfg: Config) -> dict:
         q, pm, pe, v = f[:, 1], f[:, 2], f[:, 3], f[:, 4]
         vwap_e = float((pe * q).sum() / q.sum())
         vwap_m = float((pm * v).sum() / v.sum()) if v.sum() > 0 else np.nan
-        return {"rebanadas": len(f), "minutos": int(f[-1, 0] - f[0, 0] + 1), "vwap_exec": vwap_e,
+        return {"rebanadas": len(f), "minutos": int(f[-1, 0] - f[0, 0] + 5), "vwap_exec": vwap_e,
                 "vwap_mercado": vwap_m, "slippage_bps": (vwap_e - vwap_m) / vwap_m * 1e4,
                 "slippage_medio": float(f[:, 5].mean()), "total_cost": float((pe - pm).sum()),
                 "q_max_vs_min": float(np.max(q / np.maximum(v, 1))), "inicio": int(f[0, 0])}
@@ -3246,7 +3353,7 @@ def reporte_tu_script(res: Resultado) -> None:
               f"{_precio_pts(r['vwap_mercado']):>15}{r['q_max_vs_min']:>9.2f}")
     print(f"  Tu script declararía MEJOR a {tu['mejor']}. Por qué no se puede concluir eso:")
     po = tu["res"]["POV"]
-    print(f"   · POV termina en {po['minutos']} minutos; TWAP y VWAP en {tu['minutos']}: no son la misma orden.")
+    print(f"   · POV termina en {po['minutos']} minutos; TWAP y VWAP en {tu['res']['TWAP']['minutos']}: no son la misma orden.")
     print("   · Cada algoritmo se compara con SU propio 'VWAP de mercado' (sólo los minutos en que operó).")
     print("   · VWAP usa el volumen del mismo día (futuro) y POV el del bloque que todavía no ocurre.")
     print("   · Todo se ejecuta al cierre de un minuto; el slippage es una fórmula inventada (5-10 bps × q/V)")
@@ -3296,11 +3403,12 @@ def reporte_mle(res: Resultado) -> None:
             se = aj.se.get(n, np.nan)
             fijo = n != "A" and n not in aj.libres
             dec = 4 if n == "A" else (0 if n == "tau" else 2)
-            txt = f"{v:.{dec}f}" + ("" if fijo or not np.isfinite(se) else f"±{se:.{dec}f}") + ("*" if fijo else "")
+            txt = (f"{v:.{dec}f}" + ("" if fijo or not np.isfinite(se) else f"±{se:.{dec}f}") + ("*" if fijo else "")
+                   + ("†" if n in aj.en_cota else ""))
             celdas.append(txt.rjust(14))
         d = aj.claic - mejor if np.isfinite(aj.claic) else np.nan
         print(f"  {aj.esp.nombre[:43]:<44}" + "".join(celdas) + f"{_fmt(d, 1, 12)}")
-    print("  (* fijo · CLAIC: diferencia con el mejor; la verosimilitud compuesta penaliza con tr(J·H⁻¹))")
+    print("  (* fijo · † en la cota, sin EE · CLAIC: diferencia con el mejor; la verosimilitud compuesta penaliza con tr(J·H⁻¹))")
     aj = res.ajustes["respuesta"]
     for nm, val in (("delta", 0.5), ("delta", 1.0)):
         t, p = prueba_wald(aj, nm, val)
@@ -3309,9 +3417,12 @@ def reporte_mle(res: Resultado) -> None:
     print(f"  Decaimiento: g promedio 15-60 s = {gb:.2f} (1 = nada decae) · t = {tg:.2f} · p = {pg:.3f}")
     if len(res.perfil):
         P = res.perfil
-        dentro = P.loc[P["lr"] <= P.attrs["umbral"], "delta"]
-        if len(dentro):
-            print(f"  Perfil de δ (LR escalado por ĉ = {P.attrs['c']:.2f}): IC 95 % ≈ [{dentro.min():.1f}, {dentro.max():.1f}]")
+        lo, hi = P.attrs.get("ic", (np.nan, np.nan))
+        lr1 = P.loc[np.isclose(P["delta"], 1.0), "lr"]
+        lr5 = P.loc[np.isclose(P["delta"], 0.5), "lr"]
+        print(f"  Perfil de δ (LR escalado por ĉ = {P.attrs['c']:.2f}): IC 95 % [{_fmt(lo, 3, 5).strip()}, {_fmt(hi, 3, 5).strip()}]"
+              + (f" · LR(δ = 0.5) = {lr5.iloc[0]:.1f}" if len(lr5) else "") + (f" · LR(δ = 1) = {lr1.iloc[0]:.0f}" if len(lr1) else "")
+              + f" (umbral {P.attrs['umbral']:.1f})")
     cp = res.costo_propio
     if np.isfinite(cp.get("c", np.nan)):
         print(f"  Costo propio del agresor: {cp['c']:.2f} ± {cp['se']:.2f} × su impacto (n = {cp['n']:,}; el optimizador usa ½)")
@@ -3359,7 +3470,8 @@ def reporte_backtest(res: Resultado) -> None:
         print(f"  {f['algoritmo']:<9}{f['costo']:>9.3f}{_usd(f['costo'], cfg):>13}{_fmt(f['dif_vs_twap'], 3, 10)}"
               f"{_fmt(f['p_holm'], 3, 8)}{_fmt(f['mde'], 3, 8)}{_fmt(f['riesgo'], 1, 9)}  {f['veredicto']}")
     print("  costo = promedio de compra y venta (cancela la trayectoria: queda el costo MODELADO) · riesgo = desv. del")
-    print("  IS de un solo lado entre sesiones (timing real) · MDE = diferencia mínima detectable con 80 % de potencia")
+    print("  IS de un solo lado entre sesiones (timing real) · MDE = diferencia mínima detectable con 80 % de potencia ·")
+    print("  'irrelevante' = significativa pero menor que 0.02 t/c o que el 0.5 % del costo de TWAP")
     A = bt.filas.groupby("algoritmo")[["spread", "propio", "transitorio", "permanente", "timing"]].mean() / X
     print("\n  Descomposición (ticks por contrato, promedio de sesiones y lados):")
     print(f"  {'algoritmo':<9}{'spread':>9}{'propio':>9}{'transit.':>10}{'perman.':>9}{'timing':>9}   part. máx  forzado")
@@ -3370,7 +3482,7 @@ def reporte_backtest(res: Resultado) -> None:
             r = A.loc[nm]
             print(f"  {nm:<9}{r['spread']:>9.3f}{r['propio']:>9.3f}{r['transitorio']:>10.3f}{r['permanente']:>9.3f}"
                   f"{r['timing']:>9.3f}   {pm[nm]:>8.1%}  {fz[nm]:>7.0f}")
-    print("  El permanente (π·f̄/q·X²/2) es IGUAL para cualquier plan que termine: lo que los distingue es el")
+    print("  El permanente (½·κ_P·X², κ_P = π·f̄/q) es IGUAL para cualquier plan que termine: lo que los distingue es el")
     print("  transitorio (ir rápido lo acumula) contra el riesgo de timing (ir lento lo expone).")
     if len(bt.parametrica):
         P = bt.parametrica
@@ -3383,10 +3495,10 @@ def reporte_backtest(res: Resultado) -> None:
     if len(bt.arrepentimiento):
         T = bt.arrepentimiento.pivot(index="modelo", columns="algoritmo", values="arrepentimiento")
         cols = [c for c in ALGORITMOS if c in T.columns]
-        print("\n  Arrepentimiento si la verdad es otra (ticks por contrato sobre el óptimo de ESE modelo):")
+        print("\n  Arrepentimiento si la verdad es otra (E + λ·Var en ticks por contrato, sobre el óptimo de ESE modelo):")
         print(f"  {'':<26}" + "".join(f"{c:>9}" for c in cols))
         for nm_m, f in T.iterrows():
-            print(f"  {nm_m:<26}" + "".join(f"{f[c]:>9.3f}" for c in cols))
+            print(f"  {nm_m:<26}" + "".join(_fmt(f[c], 3, 9) for c in cols))
     if np.isfinite(bt.pico.get("razon", np.nan)):
         print(f"\n  Impacto pico de la orden: {bt.pico['pico']:.1f} ticks · ley de raíz cuadrada {bt.pico['raiz']:.1f} ticks "
               f"(razón {bt.pico['razon']:.2f})")
@@ -3397,7 +3509,10 @@ def reporte_objetivo(res: Resultado) -> None:
     if not bt.detalle:
         return
     X = float(cfg.orden)
-    _titulo(f"5 · LA SESIÓN OBJETIVO ({cfg.sesion_objetivo}) · {_lado_txt(cfg)} de {cfg.orden:,} · réplica clip a clip")
+    fecha_r = f"{fecha_de_dia(bt.mercado.dia):%Y-%m-%d}"
+    _titulo(f"5 · LA SESIÓN OBJETIVO ({fecha_r}) · {_lado_txt(cfg)} de {cfg.orden:,} · réplica clip a clip")
+    if fecha_r != cfg.sesion_objetivo:
+        print(f"  ⚠ La sesión pedida ({cfg.sesion_objetivo}) no se pudo replicar: se muestra la última que sí.")
     print(f"  Precio de llegada {bt.real.mid[0] * tick(cfg.symbol):,.2f} · final {bt.real.mid_fin * tick(cfg.symbol):,.2f} · "
           "IS = lado·(precio medio − llegada)")
     print(f"  {'algoritmo':<9}{'IS t/c':>8}{'IS bps':>8}{'en US$':>13}{'vs VWAP':>9}{'vs VWAP*':>10}{'timing':>9}{'modelo':>9}{'z':>7}")
@@ -3615,7 +3730,8 @@ def panel_precio(res: Resultado, ax, axv) -> None:
     b = res.barras.reindex(np.arange(m0, m0 + n_min))
     x = np.arange(n_min) + 0.5
     mid = b["mid"].to_numpy(dtype=float) * tk
-    _estilo(ax, f"(a) {cfg.sesion_objetivo} · precio, grandes institucionales y ejecución del ÓPTIMO ({_lado_txt(cfg)} {cfg.orden:,})")
+    _estilo(ax, f"(a) {fecha_de_dia(mer.dia):%Y-%m-%d} · precio, grandes institucionales y ejecución del ÓPTIMO "
+                f"({_lado_txt(cfg)} {cfg.orden:,})")
     ax.plot(x, mid, color=C["tinta2"], linewidth=0.9, label="mid", zorder=2)
     v = real.vol_min
     vw = np.where(np.isfinite(real.vwap_min), real.vwap_min, np.nan)
@@ -3672,14 +3788,14 @@ def panel_ajuste(res: Resultado, ax_q, ax_h) -> None:
     obs = res.obs
     aj = res.ajustes["respuesta"]
     K = obs.K
-    _estilo(ax_q, "(b) Ajuste MLE · impacto inicial vs tamaño del print")
+    _estilo(ax_q, "(b) Ajuste MLE · impacto inicial vs tamaño del print (modelo en los mismos eventos)")
     x = K["x"].to_numpy()
     y = K["lado"].to_numpy() * obs.dm[:, 0] / K["sig5"].to_numpy()
     ok = np.isfinite(x) & np.isfinite(y) & (x > 0)
     bordes = np.unique(np.quantile(x[ok], np.linspace(0, 1, 11)))
     cb = np.clip(np.searchsorted(bordes, x, side="right") - 1, 0, len(bordes) - 2)
     ses = K["sesion"].to_numpy()
-    xm, ym, ye = [], [], []
+    xm, ym, ye, bins = [], [], [], []
     for j in range(len(bordes) - 1):
         m = ok & (cb == j)
         if m.sum() < 20:
@@ -3688,16 +3804,18 @@ def panel_ajuste(res: Resultado, ax_q, ax_h) -> None:
         xm.append(float(np.exp(np.mean(np.log(x[m])))))
         ym.append(r["media"])
         ye.append(r["media"] - r["ic_bajo"] if np.isfinite(r["ic_bajo"]) else 0.0)
+        bins.append(m)
     if xm:
         ax_q.errorbar(xm, ym, yerr=ye, fmt="o", color=C["tinta"], markersize=4, capsize=2, linewidth=0.9,
                       label="empírico (media ± IC por sesión)", zorder=4)
-    xs = np.geomspace(max(np.nanmin(x[ok]), 1e-6), np.nanmax(x[ok]), 60) if ok.any() else np.array([])
+    # el modelo, evaluado en los MISMOS eventos de cada bin: A·Σₑ((qₑ/V₅)/x_ref)^δ·G(e'₀)
     for nm, col, ls in (("respuesta", C["s2"], "-"), ("raiz", C["s1"], "--"), ("lineal", C["s7"], ":")):
         a = res.ajustes.get(nm)
-        if a is None or not len(xs):
+        if a is None or not bins:
             continue
-        g0a = np.nanmedian(kernel(obs.e1[:, 0], a.p["pi"], a.p["tau"]))
-        ax_q.plot(xs, a.A * (xs / a.x_ref) ** a.p["delta"] * g0a, color=col, linestyle=ls, linewidth=1.4,
+        pred = (a.A * base_huella(obs.qe, obs.ptr, np.ones(obs.n), K["v5"].to_numpy(), a.p["delta"], a.x_ref)
+                * kernel(obs.e1[:, 0], a.p["pi"], a.p["tau"]))
+        ax_q.plot(xm, [float(np.nanmean(pred[m])) for m in bins], color=col, linestyle=ls, linewidth=1.4, marker=".",
                   label=f"{a.esp.nombre.split('(')[0].strip()} δ = {a.p['delta']:.2f}")
     ax_q.set_xscale("log")
     ax_q.axhline(0, color=C["eje"], linewidth=0.8)
@@ -3816,7 +3934,7 @@ def panel_inventario(res: Resultado, ax, axc) -> None:
         axc.errorbar([m_], [y_], xerr=[[ic], [ic]] if np.isfinite(ic) else None, fmt="o", color=COLOR_ALGO[nm],
                      markersize=6, capsize=3, linewidth=1.4)
         f = Cm.loc[nm]
-        axc.text(1.02, y_, f"{f['veredicto'].replace(' (', chr(10) + '(')}\nriesgo {f['riesgo']:.0f}", transform=axc.get_yaxis_transform(),
+        axc.text(1.02, y_, f"{f['veredicto'].replace(', ', chr(10))}\nriesgo {f['riesgo']:.0f}", transform=axc.get_yaxis_transform(),
                  fontsize=6.8, color=C["tinta2"], va="center")
     axc.axvline(0, color=C["tinta2"], linewidth=0.9)
     axc.set_yticks(yy)
@@ -3840,10 +3958,11 @@ def tablero_cuadruple(res: Resultado, plt, ruta: Path):
     panel_rolling(res, a1, fig.add_subplot(gc[1], sharex=a1), fig.add_subplot(gc[2], sharex=a1))
     gd = gs[1, 1].subgridspec(1, 2, width_ratios=[1.45, 1], wspace=0.22)
     panel_inventario(res, fig.add_subplot(gd[0]), fig.add_subplot(gd[1]))
-    aj = res.ajustes["respuesta"]
+    aj = res.ajustes[cfg.modelo_ejecucion]
     fig.suptitle(f"Optimal Execution · {cfg.symbol} ({nombre(cfg.symbol)}) · {_lado_txt(cfg)} de {cfg.orden:,} contratos · "
                  f"{cfg.inicio_ct}-{cfg.fin_ct} CT", x=0.045, ha="left", fontsize=15, color=C["tinta"], y=0.975)
-    fig.text(0.045, 0.937, f"Impacto ∝ (Q/V₅)^{aj.p['delta']:.2f} · {aj.p['pi']:.0%} permanente · τ ≈ {aj.p['tau']:.0f} s · "
+    fig.text(0.045, 0.937, f"Modelo de ejecución ({cfg.modelo_ejecucion}): impacto ∝ (Q/V₅)^{aj.p['delta']:.2f} · "
+             f"{aj.p['pi']:.0%} permanente · τ ≈ {aj.p['tau']:.0f} s · "
              f"{res.obs.n:,} eventos clave en {aj.sesiones} sesiones · walk-forward de {res.info['sesiones_prueba']} sesiones · "
              f"{'SIMULACIÓN (verdad conocida)' if res.verdad else 'datos de Databento GLBX.MDP3'}",
              fontsize=9.5, color=C["tinta2"])
@@ -3862,10 +3981,20 @@ def tablero_auditoria(res: Resultado, plt, ruta: Path):
     _estilo(a, "Perfil de verosimilitud de δ (LR escalado)")
     if len(res.perfil):
         P = res.perfil
-        a.plot(P["delta"], P["lr"], "-o", color=C["s2"], markersize=4, linewidth=1.3)
+        tope = max(4 * P.attrs["umbral"], 1)
+        vis = P[P["lr"] <= 3 * tope]
+        a.plot(vis["delta"], vis["lr"], "-o", color=C["s2"], markersize=4, linewidth=1.3)
         a.axhline(P.attrs["umbral"], color=C["tinta2"], linestyle="--", linewidth=0.9, label=f"umbral 95 % (ĉ = {P.attrs['c']:.2f})")
-        a.axvline(0.5, color=C["s1"], linewidth=0.8, linestyle=":", label="raíz cuadrada")
-        a.set_ylim(0, max(4 * P.attrs["umbral"], 1))
+        if vis["delta"].min() <= 0.5 <= vis["delta"].max():
+            a.axvline(0.5, color=C["s1"], linewidth=0.8, linestyle=":", label="raíz cuadrada")
+        lo, hi = P.attrs.get("ic", (np.nan, np.nan))
+        if np.isfinite(lo) and np.isfinite(hi):
+            a.axvspan(lo, hi, color=C["s2"], alpha=0.10, linewidth=0, label=f"IC 95 % [{lo:.3f}, {hi:.3f}]")
+        lr1 = P.loc[np.isclose(P["delta"], 1.0), "lr"]
+        if len(lr1) and lr1.iloc[0] > 3 * tope:
+            a.text(0.98, 0.04, f"δ = 1 (lineal): LR = {lr1.iloc[0]:,.0f}", transform=a.transAxes, ha="right", fontsize=7.5,
+                   color=C["tinta2"])
+        a.set_ylim(0, tope)
         a.set_xlabel("δ", color=C["tinta2"], fontsize=8)
         _leyenda(a, fontsize=7, loc="upper center")
     else:
@@ -3993,7 +4122,7 @@ def tablero_auditoria(res: Resultado, plt, ruta: Path):
         _leyenda(a, fontsize=6.8, loc="upper center")
     # 10. arrepentimiento
     a = ax[2][1]
-    _estilo(a, "Arrepentimiento si la verdad es otra (t/c)")
+    _estilo(a, "Arrepentimiento si la verdad es otra (E + λ·Var, t/c)")
     Ar = bt.arrepentimiento
     if len(Ar):
         T = Ar.pivot(index="modelo", columns="algoritmo", values="arrepentimiento")
@@ -4037,7 +4166,10 @@ def tablero_auditoria(res: Resultado, plt, ruta: Path):
     a.axis("off")
     a.set_title("Chequeo de cordura", color=C["tinta"], fontsize=10, loc="left", pad=8)
     y = 0.98
-    for ok, txt in res.cordura[:17]:
+    orden_ = sorted(res.cordura, key=lambda c_: c_[0])         # primero las ⚠
+    if len(orden_) > 17:
+        orden_ = orden_[:16] + [(True, f"… y {len(res.cordura) - 16} más (ver la consola)")]
+    for ok, txt in orden_:
         corto = txt if len(txt) <= 70 else txt[:67] + "…"
         a.text(0.0, y, ("✓ " if ok else "⚠ ") + corto, transform=a.transAxes, fontsize=7.2, va="top",
                color=C["s6"] if ok else C["s8"])
@@ -4169,7 +4301,7 @@ def mensaje_telegram(res: Resultado, solo_plan: bool = False, limite: int = 4096
             for _, f in bt.comparacion.iterrows():
                 lin.append(esc(f"  {f['algoritmo']:<7} {f['costo']:.3f} ({_usd(f['costo'], cfg)}) · riesgo {f['riesgo']:.0f} · {f['veredicto']}"))
         if bt.detalle:
-            lin.append(f"<b>Sesión {esc(cfg.sesion_objetivo)}</b> (IS t/c, con el timing real):")
+            lin.append(f"<b>Sesión {fecha_de_dia(bt.mercado.dia):%Y-%m-%d}</b> (IS t/c, con el timing real):")
             lin.append(esc("  " + " · ".join(f"{nm} {bt.detalle[nm]['is_por_contrato']:+.2f}" for nm in ALGORITMOS if nm in bt.detalle)))
     if len(res.plan):
         P = res.plan
@@ -4257,7 +4389,11 @@ def guardar(res: Resultado, solo_plan: bool = False) -> Path:
     if len(res.plan):
         P = res.plan.copy()
         P.insert(0, "fecha", f"{fecha_de_dia(res.plan_info['dia']):%Y-%m-%d}")
-        P.to_csv(carpeta / f"ejecucion_plan_{_nombre_seguro(raiz(cfg.symbol), P['fecha'].iloc[0].replace('-', ''))}.csv", index=False)
+        P.insert(1, "lado", _lado_txt(cfg))
+        P.insert(2, "orden", cfg.orden)
+        P.insert(3, "urgencia", cfg.urgencia)
+        P.to_csv(carpeta / f"ejecucion_plan_{_nombre_seguro(raiz(cfg.symbol), P['fecha'].iloc[0].replace('-', ''), _lado_txt(cfg).lower(), cfg.orden)}.csv",
+                 index=False)
     if solo_plan:
         print(f"💾 Plan guardado en {carpeta}")
         return carpeta
@@ -4271,7 +4407,7 @@ def guardar(res: Resultado, solo_plan: bool = False) -> Path:
     K["precio_mid0"] = K["mid0"] * tk
     K["precio_vwap"] = K["vwap"] * tk
     for j, h in enumerate(obs.horizontes):
-        K[f"dmid_{int(h)}s_ticks"] = obs.dm[:, j]
+        K[f"dmid_{int(h)}s_ticks_sin_deriva"] = obs.dm[:, j]
     K.to_csv(carpeta / f"ejecucion_eventos_clave_{suf}.csv", index=False)
     filas = []
     for nm, aj in res.ajustes.items():
@@ -4294,12 +4430,14 @@ def guardar(res: Resultado, solo_plan: bool = False) -> Path:
         F = bt.filas.copy()
         F.insert(1, "fecha", [f"{fecha_de_dia(int(s)):%Y-%m-%d}" for s in F["sesion"]])
         F["is_usd"] = F["is_ticks"] * valor_tick_usd(cfg.symbol)
+        F["precio_medio"] = F["precio_medio"] * tk                       # en puntos, como los demás CSV
         F.to_csv(carpeta / f"ejecucion_walkforward_{suf}.csv", index=False)
         bt.comparacion.to_csv(carpeta / f"ejecucion_comparacion_{suf}.csv", index=False)
     if bt.mercado is not None and bt.planes:
         mer = bt.mercado
         idx = a_indice(mer.t_clip)
-        O = pd.DataFrame({"hora_ct": idx.tz_convert(cfg.tz_mercado).strftime("%H:%M:%S"),
+        O = pd.DataFrame({"fecha": f"{fecha_de_dia(mer.dia):%Y-%m-%d}",
+                          "hora_ct": idx.tz_convert(cfg.tz_mercado).strftime("%H:%M:%S"),
                           "hora_cdmx": idx.tz_convert(cfg.tz_local).strftime("%H:%M:%S"),
                           "mid": bt.real.mid * tk, "spread_ticks": bt.real.spread})
         for nm, u in bt.planes.items():
@@ -4395,11 +4533,19 @@ def config_de_archivo(cfg: Config, tienda, con_sesion: bool) -> Config:
         return cfg
     meta = tienda.metadata
     t1 = int(meta.end) - 1 if meta.end else int(meta.start) + DIA_NS
-    dia = int(reloj_sesion([t1], cfg.tz_mercado)[0][0])
+    dia, seg = reloj_sesion([t1], cfg.tz_mercado)
+    dia = int(dia[0])
+    if int(seg[0]) < segundo_de_hora(cfg.fin_ct):          # la última sesión no llega al final del horizonte
+        dia = dias_previos(dia, 1)
     return replace(cfg, sesion_objetivo=f"{fecha_de_dia(dia):%Y-%m-%d}")
 
 
 def main(argv: list[str] | None = None) -> int:
+    for flujo_ in (sys.stdout, sys.stderr):                # Windows con la salida redirigida usa cp1252
+        try:
+            flujo_.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:                                  # noqa: BLE001
+            pass
     a = construir_parser().parse_args(argv)
     cfg = config_desde_args(a)
     if a.pruebas:
@@ -4566,6 +4712,11 @@ def pruebas() -> int:
     cm = max(1, int(round(60.0 / mer.clip_s)))
     check("POV decide el minuto t con el volumen de t − 1 (cambiar el minuto 40 no altera hasta el 40)",
           np.array_equal(u1[:41 * cm], u2[:41 * cm]) and not np.array_equal(u1, u2))
+    vm3 = vm.copy()
+    vm3[40] = 0.0
+    u3, f3 = plan_pov(500.0, 0.1, mer, vm3)
+    check("POV sigue operando después de un minuto sin volumen (no manda el resto al final)",
+          f3 < 1e-9 and u3[42 * cm:].sum() > 0, f"forzado {f3:.1f}")
 
     # 7-10 --------------------------------------- formas cerradas
     N, X, eta, sig2, lam = 40, 1000.0, 0.01, 4.0, 0.002
@@ -4610,9 +4761,25 @@ def pruebas() -> int:
     otros = min(obj(plan_estatico(nm, 500.0, mer, mod_r, M_r, lam_r)) for nm in ("TWAP", "VWAP", "AC"))
     check("ÓPTIMO: suma la orden, sin ventas, y ni 200 planes al azar ni TWAP/VWAP/AC bajan su E + λ·Var",
           ok_o and abs(u_o.sum() - 500) < 1e-6 and u_o.min() > -1e-9 and obj(u_o) <= min(mejor, otros) + 1e-9)
+    planes_r = {nm: plan_estatico(nm, 500.0, mer, mod_r, M_r, lam_r) for nm in ("TWAP", "VWAP", "AC", "ÓPTIMO")}
+    arr_r = arrepentimiento(500.0, mer, mod_r, lam_r, planes_r, cs)
+    mod_1 = modelo_impacto({"delta": 0.5, "pi": 1.0, "tau": 90.0}, 0.03, 0.01, mer, cs)
+    M_1 = matrices(mod_1, mer)
+    e_1 = costo_modelo(optimo_ow(500.0, 0.0, M_1, mer)[0], 500.0, M_1)[0]
+    e_min = min(costo_modelo(B @ (500.0 * np.eye(mer.N)[k]), 500.0, M_1)[0] for k in range(mer.N))
+    check("arrepentimiento ≥ 0 en E + λ·Var y el QP resuelve el caso singular (π = 1, λ = 0)",
+          arr_r["arrepentimiento"].min() > -1e-9 and e_1 <= e_min + 1e-6 * abs(e_min))
 
     # 12-13 -------------------------------------- réplica: atribución exacta y compra/venta
     real = realizado(mer, E, barras)
+    corte = (E["sesion"].to_numpy() == d) & (E["seg"].to_numpy() >= segundo_de_hora("12:00"))
+    E_corta = E[~corte].reset_index(drop=True)
+    b_corta = barras[~((barras["sesion"] == d) & (barras["seg"] >= segundo_de_hora("12:00")))]
+    d_prev = int(E.loc[E["sesion"] < d, "sesion"].max())
+    mer_p = mercado(d_prev, perf, spreads, cs)
+    E_sig = E[~((E["sesion"] == d) | ((E["sesion"] == d_prev) & (E["seg"] >= segundo_de_hora("12:00"))))].reset_index(drop=True)
+    check("una sesión cortada a mediodía (cierre anticipado) no se replica con precios de la sesión siguiente",
+          realizado(mer, E_corta, b_corta) is None and realizado(mer_p, E_sig, barras) is None and real is not None)
     r1 = ejecutar(u_o, 1, mer, mod_r, M_r, real)
     r2 = ejecutar(u_o, -1, mer, mod_r, M_r, real)
     suma = sum(r1[k] for k in ("spread", "propio", "transitorio", "permanente", "timing", "comisiones"))
@@ -4622,7 +4789,7 @@ def pruebas() -> int:
 
     # 14-16 -------------------------------------- MLE: caché, recuperación y caso nulo
     var = Varianza(perf, cs)
-    obs = eventos_clave(H, E, perf, var, deriva_sesiones(barras, cs), cs)
+    obs = eventos_clave(H, E, perf, var, deriva_sesiones(E, cs), cs)
     x_ref = x_referencia(obs)
     flujo = Flujo(H, E, perf, cs)
     vp = Verosimilitud(obs, MODELOS["propagador"], x_ref, flujo)
@@ -4632,7 +4799,14 @@ def pruebas() -> int:
     la2 = vp.por_evento(pa)[0].sum()
     lf = Verosimilitud(obs, MODELOS["propagador"], x_ref, Flujo(H, E, perf, cs)).por_evento(pa)[0].sum()
     check("la verosimilitud con cachés (Σ⁻¹ por κ ω ϕ, estado del flujo por δ τ) = la recalculada", la == la2 and abs(la - lf) < 1e-8 * abs(lf))
+    k_ = obs.k
+    crece = all(np.all(np.diff(obs.t_obs[i, :k_[i]]) > 0) for i in range(obs.n))
+    check("cada horizonte de un evento clave es una operación DISTINTA y posterior a la del anterior", crece)
     aj = ajustar(obs, MODELOS["respuesta"], x_ref, None, errores=True)
+    autov = np.linalg.eigvalsh(aj.V) if aj.V is not None else np.array([-1.0])
+    check("ω queda en el interior (sin observaciones duplicadas) y la covarianza robusta es semidefinida positiva",
+          "omega" not in aj.en_cota and autov.min() > -1e-12 * max(1.0, autov.max()),
+          f"ω = {aj.p['omega']:.3f}")
     _, seg = reloj_sesion(obs.K["t_ini"].to_numpy(), cs.tz_mercado)
     mi = np.clip(seg // 60, 0, len(ver["sig5"]) - 1)
     f_true = ver["Y"] * base_huella(obs.qe, obs.ptr, ver["sig5"][mi], ver["v5"][mi], ver["delta"], 1.0)
@@ -4650,7 +4824,7 @@ def pruebas() -> int:
     H0["clase"] = clasificar_magnitud(H0, cs)[2]
     H0["tipo"], H0["ventana"] = tipificar(H0, cs), True
     p0 = Perfiles(tabla_slots(barras_ohlcv(bar0, cs), cs, "close"), cs, tabla_slots(b00.assign(inst=0), cs, "mid"))
-    o0 = eventos_clave(H0, E00, p0, Varianza(p0, cs), deriva_sesiones(b00, cs), cs)
+    o0 = eventos_clave(H0, E00, p0, Varianza(p0, cs), deriva_sesiones(E00, cs), cs)
     A0, se0, _ = A_por_gls(o0, Ajuste(MODELOS["raiz"], dict(INICIO), 0.0, x_referencia(o0), 0.0, o0.n, 0, []))
     check("sin impacto en la simulación, A no sale distinto de 0 (|t| < 3)", abs(A0 / se0) < 3, f"A = {A0:.4f} ± {se0:.4f}")
 
@@ -4664,7 +4838,7 @@ def pruebas() -> int:
     # 18 ----------------------------------------- tu script
     tu = tu_script(bo, cs)
     check("réplica de tu script: POV al 10 % termina en minutos y tu VWAP usa el volumen del mismo día",
-          tu.get("disponible", False) and tu["res"]["POV"]["minutos"] < tu["minutos"])
+          tu.get("disponible", False) and tu["res"]["POV"]["minutos"] < tu["res"]["TWAP"]["minutos"])
 
     # 19 ----------------------------------------- validación
     malos = 0

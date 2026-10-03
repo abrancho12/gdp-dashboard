@@ -36,7 +36,7 @@ Con TBBO (cada operación con el libro justo antes) y OHLCV-1m de Databento, el 
 
 ```bash
 pip install numpy pandas matplotlib databento scipy   # scipy es opcional (sin él, Nelder–Mead propio)
-python optimal_execution.py --pruebas        # 23 pruebas internas, sin red
+python optimal_execution.py --pruebas        # 28 pruebas internas, sin red
 python optimal_execution.py --simulacion     # mercado simulado con el impacto conocido
 python optimal_execution.py                  # NQ, sesión del 20 de agosto de 2026 + 10 previas
 python optimal_execution.py --solo-plan --telegram   # sólo el plan de mañana, a tu teléfono
