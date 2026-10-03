@@ -2401,6 +2401,8 @@ def almgren_chriss(X: float, lam: float, eta: np.ndarray, sig2: np.ndarray) -> n
       (−2ηⱼ + λσⱼ²/3)·xⱼ₋₁ + (2ηⱼ + 2ηⱼ₊₁ + 2λ(σⱼ² + σⱼ₊₁²)/3)·xⱼ + (−2ηⱼ₊₁ + λσⱼ₊₁²/3)·xⱼ₊₁ = 0.
     Con η y σ constantes la solución es xⱼ = X·sinh(κ(N − j))/sinh(κN) con
     cosh κ = (2η + 2λσ²/3)/(2η − λσ²/3); con λ = 0, ηₖ·nₖ es constante (nₖ ∝ 1/ηₖ).
+
+    [v1] Tu script menciona Almgren–Chriss en la guía final ("ver indicador anterior") pero no lo implementa.
     """
     N = len(eta)
     if N == 1:
@@ -2789,6 +2791,9 @@ def comparar(F: pd.DataFrame, X: float) -> pd.DataFrame:
     modelado); RIESGO = desviación del IS de un solo lado (timing real). t con n − 1 gl, Wilcoxon y Holm.
     El veredicto usa p de Holm < 0.05 y un umbral de relevancia; el MDE (80 % de potencia) es informativo:
     la diferencia que se habría podido detectar con esas sesiones.
+
+    [v1] Tu script elige el "mejor" con el menor |slippage| de UN solo día: eso lo decide la trayectoria
+    del precio (aquí, el timing), no el algoritmo, y el valor absoluto premia igual un slippage negativo.
     """
     c = F.groupby(["sesion", "algoritmo"])["is_por_contrato"].mean().unstack()
     compra = F[F["lado"] == 1].pivot(index="sesion", columns="algoritmo", values="is_por_contrato")
