@@ -167,3 +167,6 @@ cython_debug/
 indicadores/datos_databento/
 indicadores/salidas_rastreador/
 indicadores/_prueba_telegram.png
+
+# Optimal Execution: salidas (se regeneran; la caché de Databento es la misma carpeta de arriba)
+indicadores/salidas_ejecucion/

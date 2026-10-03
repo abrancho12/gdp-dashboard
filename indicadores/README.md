@@ -22,3 +22,24 @@ python rastreador_id.py --live --telegram-live
 ```
 
 La API key se lee de `DATABENTO_API_KEY`. El token y el chat de Telegram se leen de `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`. La documentación completa está en el docstring del archivo: qué se midió, qué fallaba en el script original, límites y fuentes.
+
+## `optimal_execution.py` — Optimal Execution Algorithms (impacto por MLE y ejecución óptima)
+
+Con TBBO (cada operación con el libro justo antes) y OHLCV-1m de Databento, el script hace esto:
+
+1. **Extracción de eventos clave**: las huellas ≥ p95 de las sesiones **anteriores** (motor exacto de CME del rastreador), con el mid antes del print y a 0 s – 30 min después, el tamaño relativo al volumen de esa hora (Q/V₅) y la σ esperada.
+2. **Ajuste matemático del modelo (MLE)**: impacto `A·σ₅·Σ(qₑ/V₅)^δ` que decae como `π + (1 − π)·e^(−h/τ)`, con covarianza de difusión intradía + microestructura. QMLE gaussiano, errores estándar agrupados por sesión (CR1 + jackknife), comparación de modelos (CLAIC, Wald), curva semiparamétrica y perfil de δ.
+3. **Análisis dinámico (rolling)**: A con las últimas sesiones y δ, π, τ expansivos, siempre con lo sabido **antes** de cada sesión. A por hora del día y prueba de estabilidad de Nyblom.
+4. **Algoritmos**: TWAP, VWAP (perfil de sesiones previas), POV (con 1 min de rezago), POV*, Almgren–Chriss y ÓPTIMO (Obizhaeva–Wang con resiliencia). Se replican clip a clip en un walk-forward de compra **y** venta, con atribución exacta del costo, frontera eficiente, incertidumbre de los parámetros, arrepentimiento y comparación pareada (Holm, MDE).
+5. **Dashboard cuádruple**: precio con los large trades institucionales y nuestra ejecución · ajuste MLE · rolling · inventario y costo del walk-forward. Más un tablero de auditoría de 12 paneles.
+6. **Plan de la próxima sesión**: contratos por slice con hora de Chicago y de CDMX (CSV y Telegram).
+
+```bash
+pip install numpy pandas matplotlib databento scipy   # scipy es opcional (sin él, Nelder–Mead propio)
+python optimal_execution.py --pruebas        # 23 pruebas internas, sin red
+python optimal_execution.py --simulacion     # mercado simulado con el impacto conocido
+python optimal_execution.py                  # NQ, sesión del 20 de agosto de 2026 + 10 previas
+python optimal_execution.py --solo-plan --telegram   # sólo el plan de mañana, a tu teléfono
+```
+
+Las credenciales se leen de `DATABENTO_API_KEY`, `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID`. La documentación completa está en el docstring del archivo: qué se midió, qué fallaba en el script original, límites y fuentes.
