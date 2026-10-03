@@ -2678,7 +2678,7 @@ def backtest(sesiones: list, ajustes: dict, x_ref: float, perf: Perfiles, spread
     if mer_obj is not None and mer_obj.dia != dia_objetivo(cfg):
         avisos.append(f"la sesión objetivo {cfg.sesion_objetivo} no se pudo replicar (datos incompletos o fuera del "
                       f"archivo): se muestra la {fecha_de_dia(mer_obj.dia):%Y-%m-%d}")
-    if mod_obj is not None and not (0.0 <= mod_obj.pi_original <= PI_MAX):
+    if mod_obj is not None and not (-0.005 <= mod_obj.pi_original <= PI_MAX + 0.005):
         avisos.append(f"π̂ = {mod_obj.pi_original:.2f} fuera de [0, {PI_MAX:g}]: para ejecutar se recortó a {mod_obj.pi:.2f}")
     return Backtest(F, planes_obj, mer_obj, mod_obj, lam, fr, par, arr, comp, pico, avisos, real_obj, det_obj, forz_obj)
 
@@ -2695,7 +2695,10 @@ def frontera(X: float, mer: Mercado, mod: ModeloImpacto, M: dict, planes: dict, 
         filas.append({"tipo": "frontera", "nombre": f"κT={kT:g}", "urgencia": kT, "lam": lam, "E": E_ / X, "sd": sd / X})
     for nm, u in planes.items():
         E_, sd = costo_modelo(u, X, M)
-        filas.append({"tipo": "algoritmo", "nombre": nm, "urgencia": np.nan, "lam": np.nan, "E": E_ / X, "sd": sd / X})
+        n = u.reshape(mer.N, mer.m).sum(axis=1) if len(u) == mer.C else None
+        cabe = bool(mer.tope is None or (n is not None and np.all(n <= mer.tope * (1 + 1e-6) + 1e-6)))
+        filas.append({"tipo": "algoritmo", "nombre": nm, "urgencia": np.nan, "lam": np.nan, "E": E_ / X, "sd": sd / X,
+                      "respeta_tope": cabe})
     return pd.DataFrame(filas)
 
 
@@ -3246,7 +3249,10 @@ def cordura(res: Resultado) -> list:
             X = float(cfg.orden)
             env = fr[fr["tipo"] == "frontera"]
             malos = []
-            for _, f in fr[(fr["tipo"] == "algoritmo") & fr["nombre"].isin(["TWAP", "VWAP", "AC", "ÓPTIMO"])].iterrows():
+            alg = fr[(fr["tipo"] == "algoritmo") & fr["nombre"].isin(["TWAP", "VWAP", "AC", "ÓPTIMO"])]
+            if "respeta_tope" in alg:                          # el ÓPTIMO lleva el tope de participación: sólo se compara con los que caben
+                alg = alg[alg["respeta_tope"].fillna(True).astype(bool)]
+            for _, f in alg.iterrows():
                 obj_a = f["E"] + env["lam"].to_numpy() * X * f["sd"] ** 2
                 obj_k = env["E"].to_numpy() + env["lam"].to_numpy() * X * env["sd"].to_numpy() ** 2
                 if (obj_a < obj_k - 1e-6 * (1 + np.abs(obj_k))).any():
